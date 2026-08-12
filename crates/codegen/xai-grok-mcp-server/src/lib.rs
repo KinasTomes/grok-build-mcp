@@ -5,9 +5,11 @@
 
 mod policy;
 mod server;
+mod transport;
 
 pub use policy::{GatewayPermission, GatewayPermissionDecision, ShellPolicy};
 pub use server::GatewayServer;
+pub use transport::{HttpGateway, MCP_HTTP_ENDPOINT};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,7 @@ pub struct GatewaySession {
     workspace: PathBuf,
     toolset: Arc<FinalizedToolset>,
     permission: GatewayPermission,
+    terminal_backend: Arc<xai_grok_tools::computer::local::LocalTerminalBackend>,
     /// Retains downstream clients for as long as dynamic `McpErasedTool`s can run.
     _mcp_state: Option<Arc<Mutex<xai_grok_mcp::servers::McpState>>>,
 }
@@ -53,8 +56,10 @@ impl GatewaySession {
         // constructed directly so this executable has no dependency on the
         // workspace's agent/sampler orchestration crate. It deliberately has
         // no auth provider, API key provider, or enabled API-backed clients.
+        let terminal_backend =
+            Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new());
         let context = SessionContext {
-            backend: Arc::new(xai_grok_tools::computer::local::LocalTerminalBackend::new()),
+            backend: terminal_backend.clone(),
             fs: Arc::new(xai_grok_tools::computer::local::LocalFs),
             cwd: workspace.clone(),
             session_folder: session_folder.clone(),
@@ -114,6 +119,7 @@ impl GatewaySession {
             workspace: workspace.clone(),
             toolset: Arc::new(toolset),
             permission: GatewayPermission::coding_default(workspace.clone()),
+            terminal_backend,
             _mcp_state: None,
         })
     }
@@ -184,5 +190,24 @@ impl GatewaySession {
 
     pub fn permission(&self) -> &GatewayPermission {
         &self.permission
+    }
+
+    /// Number of configured downstream MCP servers that completed startup.
+    pub async fn downstream_server_count(&self) -> usize {
+        match &self._mcp_state {
+            Some(state) => state.lock().await.owned_clients.len(),
+            None => 0,
+        }
+    }
+
+    /// Stop session-owned terminal work and request downstream MCP transport shutdown.
+    pub async fn shutdown(&self) {
+        self.terminal_backend.cancel();
+        if let Some(state) = &self._mcp_state {
+            let clients: Vec<_> = state.lock().await.owned_clients.values().cloned().collect();
+            for client in clients {
+                client.shutdown().await;
+            }
+        }
     }
 }

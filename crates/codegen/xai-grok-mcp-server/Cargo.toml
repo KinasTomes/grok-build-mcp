@@ -10,10 +10,13 @@ anyhow = { workspace = true }
 rmcp = { version = "2.1", default-features = false, features = [
     "server",
     "transport-io",
+    "transport-streamable-http-server",
 ] }
+axum = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-util = { workspace = true }
 xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-sandbox = { path = "../xai-grok-sandbox" }
 xai-grok-mcp = { workspace = true }
@@ -25,6 +28,8 @@ rmcp = { version = "2.1", default-features = false, features = [
     "client",
     "server",
     "transport-async-rw",
+    "transport-streamable-http-client-reqwest",
+    "transport-streamable-http-server",
 ] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

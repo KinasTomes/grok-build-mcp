@@ -20,8 +20,16 @@ pub struct GatewayServer {
 
 impl GatewayServer {
     pub fn new(session: GatewaySession) -> Self {
+        Self::from_shared_session(Arc::new(session))
+    }
+
+    /// Create a protocol handler over a retained gateway session.
+    ///
+    /// Streamable HTTP invokes this once per MCP protocol session; every
+    /// handler shares the same toolset and permission policy.
+    pub fn from_shared_session(session: Arc<GatewaySession>) -> Self {
         Self {
-            session: Arc::new(session),
+            session,
             call_sequence: AtomicU64::new(1),
         }
     }

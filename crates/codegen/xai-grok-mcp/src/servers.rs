@@ -2655,6 +2655,28 @@ pub struct McpClientTimeoutOverrides {
 }
 
 impl McpClient {
+    /// Request clean termination of this client's active rmcp transport.
+    ///
+    /// Session-owning hosts use this during shutdown. It stops a ready service
+    /// and leaves future calls fail-closed; it does not recreate transports.
+    pub async fn shutdown(&self) {
+        let service = {
+            let mut state = self.state.lock().await;
+            match std::mem::replace(&mut *state, ClientState::Empty) {
+                ClientState::Ready(service) => Some(service),
+                previous => {
+                    *state = previous;
+                    None
+                }
+            }
+        };
+        if let Some(service) = service {
+            service.cancellation_token().cancel();
+        }
+        self.liveness_handle.lock().take();
+        self.init_done.notify_waiters();
+    }
+
     fn load_timeouts(
         overrides: Option<&McpClientTimeoutOverrides>,
         meta_config: Option<&McpServerMetaConfig>,

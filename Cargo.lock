@@ -8825,12 +8825,16 @@ checksum = "f00a32c3b81b7b254076a65abd5ab2551209146713ba38f73818657e865e9433"
 dependencies = [
  "async-trait",
  "base64",
+ "bytes",
  "chrono",
  "futures",
  "http 1.4.0",
+ "http-body 1.0.1",
+ "http-body-util",
  "oauth2",
  "pastey",
  "pin-project-lite",
+ "rand 0.10.0",
  "reqwest 0.13.4",
  "rmcp-macros",
  "schemars 1.0.4",
@@ -8841,8 +8845,10 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower-service",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -13532,10 +13538,12 @@ name = "xai-grok-mcp-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "rmcp",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "toml",
  "xai-file-utils",
  "xai-grok-config-types",

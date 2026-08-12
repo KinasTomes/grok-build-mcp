@@ -184,3 +184,36 @@ Claude/Cursor compatibility imports, plugins/managed client-supplied entries,
 setup preferences, and runtime `tools/list_changed` refresh/outer notification.
 Those need a follow-up extraction that also carries folder trust and managed
 policy semantics rather than copying shell merge code.
+
+## Phase 4 implementation: Streamable HTTP
+
+The gateway now supports rmcp's stateful Streamable HTTP server transport at
+the stable `/mcp` path without changing its execution boundary. HTTP creates a
+fresh `GatewayServer` protocol handler for each inbound MCP session, but every
+handler retains the same `Arc<GatewaySession>` and consequently the same
+`Arc<FinalizedToolset>`, `GatewayPermission`, workspace, terminal backend, and
+downstream `McpState` as stdio. `tools/list` therefore remains directly derived
+from finalized definitions, and all `tools/call` requests still parse, pass
+gateway permission, and dispatch through `FinalizedToolset::call`.
+
+The executable defaults to stdio. HTTP is opt-in via
+`--transport http --host <IP> --port <port>` and defaults to
+`127.0.0.1:8765`; the CLI requires an IP literal so a public bind must be an
+explicit choice (for example `--host 0.0.0.0`). rmcp validates inbound Host
+headers against the bound address, including loopback aliases when appropriate.
+An explicit non-loopback bind disables that local-only Host allowlist because a
+reverse proxy's public authority cannot be inferred from the local listener;
+such a deployment must supply its own TLS, Host and Origin checks. No browser
+origin is trusted or granted extra permissions by this phase.
+
+Shutdown is coordinated with a cancellation token: it stops accepting HTTP,
+terminates active HTTP MCP sessions, cancels the retained local terminal actor
+(which kills outstanding terminal/background processes), and calls the narrow
+public `McpClient::shutdown` API for each retained downstream client. The latter
+requests rmcp transport cancellation and makes subsequent downstream calls fail
+closed. The process-wide Workspace sandbox remains applied before either
+transport accepts calls.
+
+External web clients still need deployment security before use beyond a local
+trusted machine: TLS termination, authentication/authorization, an intentional
+public Host/Origin policy, and a safe tunnel or relay are not provided here.

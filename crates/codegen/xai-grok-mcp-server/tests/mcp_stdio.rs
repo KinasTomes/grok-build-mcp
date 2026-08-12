@@ -1,7 +1,8 @@
 use rmcp::model::{CallToolRequestParams, ClientInfo};
+use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ServiceExt};
 use tempfile::TempDir;
-use xai_grok_mcp_server::{GatewayServer, GatewaySession, READ_FILE_TOOL};
+use xai_grok_mcp_server::{GatewayServer, GatewaySession, HttpGateway, READ_FILE_TOOL};
 
 #[derive(Clone, Default)]
 struct TestClient;
@@ -36,6 +37,22 @@ async fn start_gateway_session(
         .serve(client_transport)
         .await
         .expect("MCP initialize should succeed")
+}
+
+async fn start_http_gateway_session(
+    session: GatewaySession,
+) -> (
+    HttpGateway,
+    rmcp::service::RunningService<rmcp::RoleClient, TestClient>,
+) {
+    let gateway = HttpGateway::bind(GatewayServer::new(session), "127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("HTTP gateway should bind");
+    let client = TestClient
+        .serve(StreamableHttpClientTransport::from_uri(gateway.endpoint()))
+        .await
+        .expect("HTTP MCP initialize should succeed");
+    (gateway, client)
 }
 
 #[tokio::test]
@@ -265,4 +282,180 @@ for line in sys.stdin:
             .contains("downstream:ok")
     );
     client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn streamable_http_uses_the_same_catalog_and_preserves_gateway_policy() {
+    let workspace = TempDir::new().unwrap();
+    std::fs::write(workspace.path().join("hello.txt"), "hello over HTTP\n").unwrap();
+    let expected = GatewaySession::new(workspace.path())
+        .unwrap()
+        .toolset()
+        .tool_definitions();
+    let stdio = start_gateway(&workspace).await;
+    let stdio_catalog: Vec<_> = stdio
+        .list_tools(None)
+        .await
+        .unwrap()
+        .tools
+        .into_iter()
+        .map(|tool| {
+            (
+                tool.name.to_string(),
+                tool.description.map(|value| value.to_string()),
+                (*tool.input_schema).clone(),
+            )
+        })
+        .collect();
+    let (gateway, client) =
+        start_http_gateway_session(GatewaySession::new(workspace.path()).unwrap()).await;
+
+    assert_eq!(
+        client
+            .peer_info()
+            .expect("initialize response")
+            .server_info
+            .name,
+        "xai-grok-mcp-server"
+    );
+    let listed = client.list_tools(None).await.unwrap();
+    let http_catalog: Vec<_> = listed
+        .tools
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.to_string(),
+                tool.description.as_ref().map(ToString::to_string),
+                (*tool.input_schema).clone(),
+            )
+        })
+        .collect();
+    assert_eq!(http_catalog, stdio_catalog);
+    assert_eq!(listed.tools.len(), expected.len());
+    for definition in expected {
+        let tool = listed
+            .tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == definition.function.name)
+            .unwrap();
+        assert_eq!(
+            tool.description.as_deref(),
+            definition.function.description.as_deref()
+        );
+        assert_eq!(
+            tool.input_schema.as_ref(),
+            definition.function.parameters.as_object().unwrap()
+        );
+    }
+
+    let read = client
+        .call_tool(
+            CallToolRequestParams::new(READ_FILE_TOOL).with_arguments(
+                serde_json::json!({"target_file":"hello.txt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.is_error, Some(false));
+    assert!(
+        read.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("hello over HTTP")
+    );
+
+    let dangerous = client
+        .call_tool(
+            CallToolRequestParams::new("run_terminal_cmd").with_arguments(
+                serde_json::json!({"command":"rm -rf /","description":"unsafe","is_background":false})
+                    .as_object().unwrap().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(dangerous.is_error, Some(true));
+    let outside = client
+        .call_tool(
+            CallToolRequestParams::new(READ_FILE_TOOL).with_arguments(
+                serde_json::json!({"target_file":"../outside.txt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outside.is_error, Some(true));
+    stdio.cancel().await.unwrap();
+    client.cancel().await.unwrap();
+    gateway.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn streamable_http_discovers_and_calls_downstream_tools_without_an_api_key() {
+    let workspace = TempDir::new().unwrap();
+    let script = workspace.path().join("downstream-http.py");
+    std::fs::write(&script, r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}
+    elif method == "tools/list":
+        result = {"tools":[{"name":"echo","description":"fixture HTTP echo","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}]}
+    elif method == "tools/call":
+        result = {"content":[{"type":"text","text":"downstream-http:" + request["params"]["arguments"]["value"]}]}
+    else:
+        result = {}
+    if "id" in request:
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+"#).unwrap();
+    let config = workspace.path().join("mcp.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[mcp_servers.fixture]\ncommand = \"python3\"\nargs = [\"{}\"]\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    let session = GatewaySession::with_native_mcp_config(workspace.path(), &config)
+        .await
+        .unwrap();
+    assert_eq!(session.downstream_server_count().await, 1);
+    let (gateway, client) = start_http_gateway_session(session).await;
+    assert!(
+        client
+            .list_tools(None)
+            .await
+            .unwrap()
+            .tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == "fixture__echo")
+    );
+    let result = client
+        .call_tool(
+            CallToolRequestParams::new("fixture__echo").with_arguments(
+                serde_json::json!({"value":"ok"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.is_error, Some(false));
+    assert!(
+        result.content[0]
+            .as_text()
+            .unwrap()
+            .text
+            .contains("downstream-http:ok")
+    );
+    client.cancel().await.unwrap();
+    gateway.shutdown().await.unwrap();
 }
