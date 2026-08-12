@@ -13395,6 +13395,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "toml",
  "tracing",
  "xai-grok-announcements",
  "xai-grok-config",
@@ -13535,6 +13536,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
+ "xai-file-utils",
+ "xai-grok-config-types",
+ "xai-grok-mcp",
  "xai-grok-sandbox",
  "xai-grok-tools",
 ]

@@ -12,8 +12,12 @@ rmcp = { version = "2.1", default-features = false, features = [
     "transport-io",
 ] }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-sandbox = { path = "../xai-grok-sandbox" }
+xai-grok-mcp = { workspace = true }
+xai-grok-config-types = { workspace = true }
 xai-grok-tools = { workspace = true }
 
 [dev-dependencies]

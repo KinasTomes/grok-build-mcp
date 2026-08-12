@@ -1,38 +1,38 @@
 //! Standalone MCP gateway for a deliberately small Grok Build tool runtime.
 //!
-//! This first vertical slice exposes only the read-only `read_file` tool. It
-//! deliberately owns an [`Arc<FinalizedToolset>`] directly rather than an
+//! It deliberately owns an [`Arc<FinalizedToolset>`] directly rather than an
 //! agent, sampler, ACP session, or prompt loop.
 
 mod policy;
 mod server;
 
-pub use policy::{GatewayPermission, GatewayPermissionDecision};
+pub use policy::{GatewayPermission, GatewayPermissionDecision, ShellPolicy};
 pub use server::GatewayServer;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 use xai_grok_tools::registry::types::{
     FinalizedToolset, SessionContext, ToolConfig, ToolRegistryBuilder, ToolServerConfig,
 };
 
-/// Client-facing name of the sole tool exposed by this vertical slice.
+/// Client-facing name of the primary workspace read tool.
 pub const READ_FILE_TOOL: &str = "read_file";
 
 static NEXT_GATEWAY_SESSION: AtomicU64 = AtomicU64::new(1);
 
 /// Long-lived runtime state for one gateway process/workspace.
 ///
-/// The terminal backend is retained by the finalized toolset's resources. The
-/// factory creates it once here, before finalization, so future toolset swaps
-/// can preserve the same session-lifetime backend.
+/// The terminal backend is retained by the finalized toolset's resources.
 pub struct GatewaySession {
     workspace: PathBuf,
     toolset: Arc<FinalizedToolset>,
     permission: GatewayPermission,
+    /// Retains downstream clients for as long as dynamic `McpErasedTool`s can run.
+    _mcp_state: Option<Arc<Mutex<xai_grok_mcp::servers::McpState>>>,
 }
 
 impl GatewaySession {
@@ -78,16 +78,30 @@ impl GatewaySession {
             system_reminder_tag: xai_grok_tools::reminders::DEFAULT_REMINDER_TAG,
         };
         let config = ToolServerConfig {
-            tools: vec![ToolConfig::for_tool::<
-                xai_grok_tools::implementations::grok_build::ReadFileTool,
-            >()],
+            // Deliberately local coding tools only. `search_replace` also
+            // creates new files when its old string is empty.
+            tools: vec![
+                ToolConfig::for_tool::<xai_grok_tools::implementations::grok_build::ReadFileTool>(),
+                ToolConfig::for_tool::<xai_grok_tools::implementations::grok_build::ListDirTool>(),
+                ToolConfig::for_tool::<xai_grok_tools::implementations::grok_build::GrepTool>(),
+                ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::SearchReplaceTool,
+                >(),
+                ToolConfig::for_tool::<xai_grok_tools::implementations::grok_build::BashTool>(),
+                ToolConfig::for_tool::<
+                    xai_grok_tools::implementations::grok_build::GetTerminalCommandOutputTool,
+                >(),
+                // Required by Grok's background-command invariant. The
+                // gateway policy intentionally denies direct kill requests.
+                ToolConfig::for_tool::<xai_grok_tools::implementations::grok_build::KillTaskTool>(),
+            ],
             behavior_preset: None,
         };
         let toolset = ToolRegistryBuilder::new()
             .finalize(config, context)
             .map_err(|errors| {
                 anyhow::anyhow!(
-                    "failed to finalize the read-only gateway toolset: {}",
+                    "failed to finalize the coding gateway toolset: {}",
                     errors
                         .iter()
                         .map(|error| error.summary())
@@ -97,10 +111,67 @@ impl GatewaySession {
             })?;
 
         Ok(Self {
-            workspace,
+            workspace: workspace.clone(),
             toolset: Arc::new(toolset),
-            permission: GatewayPermission::read_only(READ_FILE_TOOL),
+            permission: GatewayPermission::coding_default(workspace.clone()),
+            _mcp_state: None,
         })
+    }
+
+    /// Start native-configured MCP servers and register their discovered tools
+    /// into this session's existing finalized toolset.
+    pub async fn with_native_mcp_config(
+        workspace: impl AsRef<Path>,
+        config_path: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        let mut session = Self::new(workspace)?;
+        let config_text = std::fs::read_to_string(config_path.as_ref())?;
+        let root: toml::Value = toml::from_str(&config_text)?;
+        let native = xai_grok_config_types::native_mcp_servers_from_toml(&root);
+        session.register_downstream(native).await?;
+        Ok(session)
+    }
+
+    async fn register_downstream(
+        &mut self,
+        native: xai_grok_config_types::NativeMcpServers,
+    ) -> anyhow::Result<()> {
+        if native.servers.is_empty() {
+            return Ok(());
+        }
+        let state = Arc::new(Mutex::new(xai_grok_mcp::servers::McpState::new(
+            native.servers.clone(),
+        )));
+        let event_writer = xai_file_utils::events::EventWriter::noop();
+        let ctx = xai_grok_mcp::servers::McpSpawnCtx::session_less(&event_writer);
+        let started = xai_grok_mcp::servers::start_mcp_servers(
+            native.servers,
+            &Default::default(),
+            &Default::default(),
+            &native.oauth,
+            &ctx,
+        )
+        .await;
+        for client in started {
+            let client = Arc::new(client.map_err(|error| anyhow::anyhow!(error.to_string()))?);
+            let server_name = client.server_name().to_string();
+            state
+                .lock()
+                .await
+                .owned_clients
+                .insert(server_name, Arc::clone(&client));
+            for registration in client.get_tool_registrations(Arc::clone(&state)).await? {
+                self.permission
+                    .allow_downstream_tool(registration.name.clone());
+                self.toolset.register_tool(
+                    registration.name,
+                    registration.tool,
+                    Some(registration.input_schema),
+                )?;
+            }
+        }
+        self._mcp_state = Some(state);
+        Ok(())
     }
 
     pub fn workspace(&self) -> &Path {

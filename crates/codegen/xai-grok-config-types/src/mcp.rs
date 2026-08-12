@@ -8,6 +8,68 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use xai_grok_mcp::oauth_config::McpOAuthConfig;
 
+/// Parsed native Grok MCP configuration suitable for the shared MCP runtime.
+///
+/// This deliberately covers the native `[mcp_servers.<name>]` TOML shape only.
+/// Compatibility imports are policy/UI concerns and remain outside this leaf API.
+#[derive(Debug, Default)]
+pub struct NativeMcpServers {
+    pub servers: Vec<acp::McpServer>,
+    pub oauth: HashMap<String, McpOAuthConfig>,
+}
+
+/// Parse native Grok `[mcp_servers.<name>]` entries from TOML.
+///
+/// Invalid, disabled, or setup-incomplete entries are skipped so one bad
+/// server cannot prevent the local coding gateway from starting.
+pub fn native_mcp_servers_from_toml(root: &toml::Value) -> NativeMcpServers {
+    let Some(entries) = root.get("mcp_servers").and_then(toml::Value::as_table) else {
+        return NativeMcpServers::default();
+    };
+
+    let mut result = NativeMcpServers::default();
+    for (name, value) in entries {
+        let Ok(config) = value.clone().try_into::<McpServerConfig>() else {
+            tracing::warn!(server = %name, "skipping invalid native MCP configuration");
+            continue;
+        };
+        if config.blank_transport_field().is_some() {
+            tracing::warn!(server = %name, "skipping native MCP configuration with blank transport");
+            continue;
+        }
+        let McpSetupResolution::Resolved(mut config) = config.resolve_setup(None) else {
+            tracing::warn!(server = %name, "skipping native MCP configuration requiring setup preferences");
+            continue;
+        };
+        config.expand_strings(&expand_native_env_vars);
+        if let Some(oauth) = config.oauth_config() {
+            result.oauth.insert(name.clone(), oauth);
+        }
+        if let Some(server) = config.to_acp_mcp_server(name) {
+            result.servers.push(server);
+        }
+    }
+    result
+}
+
+fn expand_native_env_vars(value: &str) -> String {
+    let mut result = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find('}') else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let name = &after_start[..end];
+        result.push_str(&std::env::var(name).unwrap_or_default());
+        rest = &after_start[end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+
 /// serde default helper. Kept module-local rather than shared — the `pool`
 /// module keeps its own copy for `PoolConfig`.
 fn default_true() -> bool {

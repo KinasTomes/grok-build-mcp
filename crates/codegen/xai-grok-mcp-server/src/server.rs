@@ -65,7 +65,7 @@ impl ServerHandler for GatewayServer {
                 "xai-grok-mcp-server",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions("Provides a sandboxed, read-only Grok Build workspace tool runtime.")
+            .with_instructions("Provides sandboxed local Grok Build coding tools and explicitly configured downstream MCP tools.")
     }
 
     async fn list_tools(
@@ -104,7 +104,7 @@ impl ServerHandler for GatewayServer {
         if self.session.permission().evaluate(tool_name, &input) != GatewayPermissionDecision::Allow
         {
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                "Tool `{tool_name}` was denied by the gateway read-only permission policy"
+                "Tool `{tool_name}` was denied by the gateway permission policy"
             ))]));
         }
 

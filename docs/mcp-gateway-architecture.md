@@ -146,3 +146,41 @@ The preferred initial public integration API is a small extraction from shell-pr
 - Make approval behavior explicit in CLI/config and default to fail-closed for unresolved prompts.
 - Apply the sandbox before executing any tool, and tear down the session terminal backend and MCP clients on server shutdown.
 
+## Phase 3 implementation
+
+`xai-grok-mcp-server` now finalizes this explicit local coding set: `read_file`,
+`list_dir`, `grep`, `search_replace`, `run_terminal_cmd`,
+`get_terminal_command_output`, and `kill_task`. `search_replace` supplies both
+workspace edits and file creation. `kill_task` is present only because Grok's
+background-command runtime requires it; the gateway policy denies it directly.
+No API-backed, image/video, web, memory, agent/subagent, scheduler, or UI tools
+are finalized.
+
+The executable applies the existing `Workspace` sandbox profile before it
+constructs the session. This keeps filesystem writes limited to the workspace
+while allowing the explicitly selected local editing tools. Gateway permission
+middleware classifies parsed `ToolInput`: workspace-contained reads/searches and
+edits are allowed; paths escaping with `..` are denied; shell is a configurable,
+default-safe allowlist (`pwd`, `ls`, `rg`, and read-only Git inspection); direct
+task-kill and all unknown inputs are denied. Only a dynamically registered tool
+that was discovered from the configured native MCP file is allowed downstream.
+There is no ACP prompting path, so an unresolved/Ask outcome is fail-closed.
+
+### Native downstream configuration
+
+The public leaf API `xai_grok_config_types::native_mcp_servers_from_toml`
+extracts the narrow native `[mcp_servers.<name>]` parser from shell-private
+configuration handling. It resolves enabled stdio/HTTP/SSE entries, simple
+environment substitutions, and OAuth metadata; malformed, disabled, and
+setup-incomplete entries are skipped independently. The gateway currently takes
+an explicit `--mcp-config <file>` containing this native format. It starts these
+servers before serving stdio, asks each `McpClient` for registrations, retains
+the shared `McpState`, and appends every `McpErasedTool` via
+`FinalizedToolset::register_tool`. Qualified `<server>__<tool>` names and source
+schemas/descriptions are retained without a gateway copy.
+
+Unsupported in this phase: automatic global/project TOML merge, `.mcp.json`,
+Claude/Cursor compatibility imports, plugins/managed client-supplied entries,
+setup preferences, and runtime `tools/list_changed` refresh/outer notification.
+Those need a follow-up extraction that also carries folder trust and managed
+policy semantics rather than copying shell merge code.
