@@ -13527,6 +13527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-mcp-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xai-grok-sandbox",
+ "xai-grok-tools",
+]
+
+[[package]]
 name = "xai-grok-memory"
 version = "0.1.0"
 dependencies = [

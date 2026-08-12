@@ -29,6 +29,7 @@ members = [
     "crates/codegen/xai-grok-http",
     "crates/codegen/xai-grok-markdown",
     "crates/codegen/xai-grok-markdown-core",
+    "crates/codegen/xai-grok-mcp-server",
     "crates/codegen/xai-grok-mcp",
     "crates/codegen/xai-grok-memory",
     "crates/codegen/xai-grok-mermaid",
