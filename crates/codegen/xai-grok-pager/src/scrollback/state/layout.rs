@@ -1401,7 +1401,9 @@ impl ScrollbackState {
         if new_idx > 0
             && let Some((_, prev_entry)) = self.entries.get_index(new_idx - 1)
         {
-            let both_groupable = prev_entry.block.is_groupable() && new_groupable;
+            let both_groupable = prev_entry.block.is_groupable()
+                && new_groupable
+                && new_entry.dense_group_with_previous;
             let both_collapsed = prev_entry.display_mode == DisplayMode::Collapsed && new_collapsed;
             cache.entries[new_idx - 1].gap_after = if both_groupable && both_collapsed {
                 0
@@ -1581,7 +1583,8 @@ impl ScrollbackState {
             }
 
             let (_, b) = entries.get_index(j).unwrap();
-            let both_groupable = a.block.is_groupable() && b.block.is_groupable();
+            let both_groupable =
+                a.block.is_groupable() && b.block.is_groupable() && b.dense_group_with_previous;
             let both_collapsed = a.display_mode == DisplayMode::Collapsed
                 && b.display_mode == DisplayMode::Collapsed;
             cached.gap_after = if both_groupable && both_collapsed {
@@ -1633,7 +1636,7 @@ impl ScrollbackState {
         let matches = |i: usize| self.joins_dense_run(i, collapsed_only);
 
         let mut start = idx;
-        while start > 0 && matches(start - 1) {
+        while start > 0 && matches(start) {
             start -= 1;
         }
         let mut end = idx + 1;
@@ -1653,6 +1656,7 @@ impl ScrollbackState {
     pub(super) fn joins_dense_run(&self, i: usize, collapsed_only: bool) -> bool {
         if let Some((_, e)) = self.entries.get_index(i) {
             e.block.is_groupable()
+                && (i == 0 || e.dense_group_with_previous)
                 && (!collapsed_only || e.display_mode == DisplayMode::Collapsed)
                 && self.verb_group_range_of(i).is_none()
         } else {

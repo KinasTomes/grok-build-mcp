@@ -1,10 +1,13 @@
 //! `grok mcp` — manage MCP server configurations from the command line.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
+use rmcp::ServiceExt;
 use xai_grok_shell::util::config::{McpServerConfig, McpServerTransportConfig};
 
 use crate::util::display_user_grok_path;
@@ -63,6 +66,9 @@ impl McpScope {
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum McpCommand {
+    /// Start the local coding MCP gateway.
+    #[command(name = "server")]
+    Server(GatewayServerArgs),
     /// List configured MCP servers
     List {
         /// Emit machine-readable JSON output
@@ -98,6 +104,39 @@ pub enum McpCommand {
         /// Server name to check
         name: Option<String>,
     },
+}
+
+/// Arguments for `grok mcp server`. The outer pager binary has already applied
+/// the selected workspace sandbox before dispatching this command.
+#[derive(Debug, clap::Args, Clone)]
+pub struct GatewayServerArgs {
+    /// Workspace root. Defaults to the current directory.
+    #[arg(long, value_name = "DIR")]
+    pub workspace: Option<PathBuf>,
+    /// Native Grok MCP configuration file for downstream servers.
+    #[arg(long, value_name = "FILE")]
+    pub mcp_config: Option<PathBuf>,
+    /// Gateway transport.
+    #[arg(long, value_enum, default_value_t = GatewayTransport::Http)]
+    pub transport: GatewayTransport,
+    /// Interface to bind for HTTP. Defaults to loopback.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: IpAddr,
+    /// HTTP port.
+    #[arg(long, default_value_t = 8765)]
+    pub port: u16,
+    /// Show the existing Grok terminal activity/approval surface. HTTP only.
+    #[arg(long)]
+    pub ui: bool,
+    /// Use the existing terminal approval fallback instead of the observer UI.
+    #[arg(long, conflicts_with = "ui")]
+    pub terminal_approval: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GatewayTransport {
+    Stdio,
+    Http,
 }
 
 // Everything `mcp add` accepts, before validation; `resolve_add` turns it
@@ -149,6 +188,7 @@ pub struct AddArgs {
 
 pub async fn run(mcp_args: McpArgs) -> Result<()> {
     match mcp_args.command {
+        McpCommand::Server(args) => run_gateway_server(args).await,
         McpCommand::List { json } => run_list(json),
         McpCommand::Add(args) => run_add(args).await,
         McpCommand::Remove { name, scope } => run_remove(&name, scope).await,
@@ -156,6 +196,85 @@ pub async fn run(mcp_args: McpArgs) -> Result<()> {
         McpCommand::Disable { name } => run_set_enabled(&name, false).await,
         McpCommand::Doctor { json, name } => run_doctor(json, name).await,
     }
+}
+
+async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
+    if args.ui && args.transport != GatewayTransport::Http {
+        bail!("--ui is only supported with --transport http; stdio belongs to the MCP client");
+    }
+    if args.terminal_approval && args.transport != GatewayTransport::Http {
+        bail!("--terminal-approval is only supported with --transport http");
+    }
+    let workspace = dunce::canonicalize(args.workspace.unwrap_or(std::env::current_dir()?))?;
+    let session = match args.mcp_config {
+        Some(path) => {
+            xai_grok_mcp_server::GatewaySession::with_native_mcp_config(&workspace, path).await?
+        }
+        None => xai_grok_mcp_server::GatewaySession::new(&workspace)?,
+    };
+
+    if args.ui {
+        let (broker, approvals) = xai_grok_mcp_server::ChannelApprovalBroker::new(32);
+        let session = session.with_approval_broker(broker);
+        let server = xai_grok_mcp_server::GatewayServer::new(session);
+        let session = Arc::clone(server.session());
+        let bridge =
+            xai_grok_mcp_server::LocalObserverBridge::spawn(session.event_bus(), approvals);
+        let http =
+            xai_grok_mcp_server::HttpGateway::bind(server, SocketAddr::new(args.host, args.port))
+                .await?;
+        let status = crate::gateway_observer::GatewayObserverStatus {
+            workspace: workspace.display().to_string(),
+            endpoint: http.endpoint(),
+            downstream_servers: session.downstream_server_count().await,
+            exposed_tools: session.toolset().tool_definitions().len(),
+        };
+        let result = crate::gateway_observer::run(bridge, status).await;
+        http.shutdown().await?;
+        return result;
+    }
+
+    let session = if args.terminal_approval {
+        session.with_approval_broker(Arc::new(xai_grok_mcp_server::TerminalApprovalBroker))
+    } else {
+        session
+    };
+    let downstream_servers = session.downstream_server_count().await;
+    let exposed_tools = session.toolset().tool_definitions().len();
+    let server = xai_grok_mcp_server::GatewayServer::new(session);
+    match args.transport {
+        GatewayTransport::Stdio => {
+            eprintln!(
+                "grok mcp server stdio workspace={} downstream_servers={} exposed_tools={}",
+                workspace.display(),
+                downstream_servers,
+                exposed_tools
+            );
+            server
+                .serve(rmcp::transport::stdio())
+                .await?
+                .waiting()
+                .await?;
+        }
+        GatewayTransport::Http => {
+            let http = xai_grok_mcp_server::HttpGateway::bind(
+                server,
+                SocketAddr::new(args.host, args.port),
+            )
+            .await?;
+            eprintln!(
+                "grok mcp server HTTP bound={} workspace={} endpoint={} downstream_servers={} exposed_tools={}",
+                http.address(),
+                workspace.display(),
+                http.endpoint(),
+                downstream_servers,
+                exposed_tools
+            );
+            tokio::signal::ctrl_c().await?;
+            http.shutdown().await?;
+        }
+    }
+    Ok(())
 }
 
 fn run_list(json: bool) -> Result<()> {

@@ -15,6 +15,7 @@ pub mod docs;
 pub mod doctor_cmd;
 pub mod export_cmd;
 pub(crate) mod fs_size;
+pub mod gateway_observer;
 pub mod git_info;
 pub mod headless;
 pub mod hyperlink_route;

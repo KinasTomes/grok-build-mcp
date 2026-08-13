@@ -2,6 +2,7 @@ mod debug_redact;
 pub mod find_protoc;
 
 use anyhow::Context;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, iter};
@@ -29,6 +30,46 @@ fn find_protoc_include_dir(protoc: Option<&Path>) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// Parse the Makefile-style dependency output emitted by `protoc`.
+///
+/// `protoc` writes the descriptor output path as the target on the first line.
+/// Do not split on `:` here: a Windows target path contains a drive-letter
+/// colon. Instead, remove the exact descriptor path that we passed to protoc.
+fn parse_protoc_dependencies<'a>(
+    dependency_output: &'a str,
+    descriptor_output_path: &Path,
+) -> anyhow::Result<Vec<&'a str>> {
+    let mut lines = dependency_output.lines();
+    let first_line = lines.next().context("protoc dependency output is empty")?;
+    let expected_prefix = format!("{}:", descriptor_output_path.display());
+    let first_dependency = first_line.strip_prefix(&expected_prefix).with_context(|| {
+        format!(
+            "protoc dependency output must start with {expected_prefix:?}: {dependency_output:?}"
+        )
+    })?;
+
+    Ok(iter::once(first_dependency)
+        .chain(lines)
+        .map(str::trim)
+        .map(|line| line.strip_suffix('\\').unwrap_or(line).trim())
+        .filter(|line| !line.is_empty())
+        .collect())
+}
+
+fn is_well_known_type_include(path: &str) -> bool {
+    // protoc writes native path separators in dependency files. Normalize only
+    // for this comparison so the existing well-known-type filtering applies on
+    // both Unix and Windows.
+    path.replace('\\', "/")
+        .contains("/include/google/protobuf/")
+}
+
+fn protoc_output_argument(flag: &str, path: &Path) -> OsString {
+    let mut argument = OsString::from(flag);
+    argument.push(path);
+    argument
 }
 
 pub struct XaiProtoBuilder {
@@ -127,10 +168,20 @@ impl XaiProtoBuilder {
 
         // Can only process one input file when using --dependency_out=FILE.
         for proto in protos {
+            let temporary_outputs = tempfile::TempDir::new()
+                .context("failed to create temporary protoc output directory")?;
+            let dependency_output_path = temporary_outputs.path().join("protoc-dependencies.d");
+            let descriptor_output_path = temporary_outputs.path().join("protoc-descriptor.pb");
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
-                .arg("--dependency_out=/dev/stdout")
-                .arg("--descriptor_set_out=/dev/null");
+                .arg(protoc_output_argument(
+                    "--dependency_out=",
+                    &dependency_output_path,
+                ))
+                .arg(protoc_output_argument(
+                    "--descriptor_set_out=",
+                    &descriptor_output_path,
+                ));
 
             // Add protoc's well-known types include directory first (if found).
             // This is needed for Bazel sandboxed builds where protoc and its
@@ -150,28 +201,25 @@ impl XaiProtoBuilder {
 
             command.stdin(Stdio::null());
             command.stderr(Stdio::inherit());
+            command.stdout(Stdio::null());
 
-            let output = command.output().context("protoc command failed")?;
-            if !output.status.success() {
+            let status = command.status().context("protoc command failed")?;
+            if !status.success() {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output =
-                String::from_utf8(output.stdout).context("protoc command output not UTF-8")?;
-
-            let mut lines = output.lines();
-            let first_line = lines.next().context("protoc command output is empty")?;
-            let prefix = "/dev/null:";
-            let rem = first_line.strip_prefix(prefix).with_context(|| {
-                format!("protoc command output must start with /dev/null: {output:?}")
-            })?;
-            for line in iter::once(rem).chain(lines) {
-                let line = line.trim();
-                let line = line.strip_suffix("\\").unwrap_or(line);
+            let dependency_output =
+                fs::read_to_string(&dependency_output_path).with_context(|| {
+                    format!(
+                        "failed to read protoc dependency output {}",
+                        dependency_output_path.display()
+                    )
+                })?;
+            for line in parse_protoc_dependencies(&dependency_output, &descriptor_output_path)? {
                 // Depending on absolute paths like
                 // /Users/user/homebrew/Cellar/protobuf/29.1/include/google/protobuf/timestamp.proto
                 // is valid, but we want to have output more deterministic.
-                if line.contains("/include/google/protobuf/") {
+                if is_well_known_type_include(line) {
                     continue;
                 }
 
@@ -324,5 +372,52 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
         honor_debug_redact: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_protoc_dependencies;
+    use std::path::Path;
+
+    #[test]
+    fn parses_unix_dependency_output() {
+        let descriptor = Path::new("/tmp/protoc-descriptor.pb");
+        let output = "/tmp/protoc-descriptor.pb: proto/service.proto\n";
+
+        assert_eq!(
+            parse_protoc_dependencies(output, descriptor).unwrap(),
+            vec!["proto/service.proto"]
+        );
+    }
+
+    #[test]
+    fn parses_windows_drive_letter_dependency_output() {
+        let descriptor = Path::new(r"D:\build\protoc-descriptor.pb");
+        let output = r"D:\build\protoc-descriptor.pb: D:\work\proto\service.proto";
+
+        assert_eq!(
+            parse_protoc_dependencies(output, descriptor).unwrap(),
+            vec![r"D:\work\proto\service.proto"]
+        );
+    }
+
+    #[test]
+    fn parses_multiline_dependency_output() {
+        let descriptor = Path::new("/tmp/protoc-descriptor.pb");
+        let output = concat!(
+            "/tmp/protoc-descriptor.pb: proto/service.proto \\\n",
+            "  proto/common.proto \\\n",
+            "  proto/last.proto\n",
+        );
+
+        assert_eq!(
+            parse_protoc_dependencies(output, descriptor).unwrap(),
+            vec![
+                "proto/service.proto",
+                "proto/common.proto",
+                "proto/last.proto"
+            ]
+        );
     }
 }
