@@ -1,0 +1,46 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-mcp
+
+      - name: Install protoc
+        shell: powershell
+        run: |
+          choco install protoc -y
+          protoc --version
+
+      - name: Cargo check
+        run: cargo check -p xai-grok-mcp-server
+
+      - name: Run tests
+        run: cargo test -p xai-grok-mcp-server
+
+      - name: Build release
+        run: cargo build --release -p xai-grok-mcp-server
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: xai-grok-mcp-server-windows-x64
+          path: target/release/xai-grok-mcp-server.exe
