@@ -62,7 +62,12 @@ pub(crate) fn run_step(entry: &ScrollbackEntry, show_thinking: bool) -> RunStep 
         && !entry.is_pending_user_input
         && entry.hook_data.is_none();
     if let RenderBlock::ToolCall(block) = &entry.block
-        && let Some(kind) = block.verb_group_kind()
+        && let Some(kind) = block.verb_group_kind().or_else(|| {
+            entry
+                .force_activity_group
+                .then(|| block.label_kind())
+                .flatten()
+        })
         && !entry.is_pending_user_input
     {
         if entry.display_mode == DisplayMode::Collapsed {
@@ -688,6 +693,16 @@ mod tests {
 
     fn execute() -> ScrollbackEntry {
         ScrollbackEntry::new(RenderBlock::execute("ls")).with_display_mode(DisplayMode::Collapsed)
+    }
+
+    #[test]
+    fn producer_activity_group_can_include_a_command() {
+        let mut command = execute();
+        command.force_activity_group = true;
+        assert!(matches!(
+            run_step(&command, true),
+            RunStep::Member(VerbGroupKind::Command)
+        ));
     }
 
     fn thought() -> ScrollbackEntry {

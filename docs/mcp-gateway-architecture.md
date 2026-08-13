@@ -299,22 +299,46 @@ status affordances are supplied by the existing `views::status_bar` and
 The normal agent-owned scrollback and interaction controllers consume
 `AcpSession` request IDs and prompt queues, so observer mode deliberately does
 not construct `AppView` or `AgentView`. It does reuse the pager binary,
-terminal lifecycle, crossterm/ratatui renderer stack, theme, and the existing
-`render_permission_view` renderer. A short-lived display-only
+terminal lifecycle, crossterm/ratatui renderer stack, theme, existing
+`ScrollbackState`/`ScrollbackPane`, `BlockViewerPane`, `PromptWidget` chrome,
+and the existing `render_permission_view` renderer. A short-lived display-only
 `PermissionViewState` is translated from the redacted gateway event; its ACP
 sender is never used, and `LocalObserverBridge` remains the only approval
 authority. The scrollback area contains only remote tool calls (running,
 succeeded, or failed), styled with the same Grok tool-call visual language.
-There is no `PromptWidget`, slash routing, prompt submission path, local model
-label, or transcript.
+The normal Grok composer is retained strictly as read-only status chrome: it
+has no slash routing, prompt submission path, local model, or transcript.
+
+Observer mode now uses the real `ScrollbackState`, `ScrollbackPane`, and
+`BlockViewerPane`, rather than a parallel list implementation. A left mouse
+click focuses the corresponding tool entry; Up/Down (or j/k) move that normal
+scrollback selection; Enter opens command output in the existing Grok block
+viewer, while Left/Right collapse or expand a selected block. The only detail
+payload forwarded from the gateway is a bounded, redacted excerpt of terminal
+output. File content and arbitrary non-terminal tool output remain absent from
+the observer stream. For approvals, the existing permission renderer presents
+only `Allow once` and `Deny`; Up/Down selects either option and Enter resolves
+the oldest pending approval.
+
+The observer keeps the normal Grok composer chrome as a read-only status
+surface. It starts focused, displays `Remote MCP · manual approval`, and never
+routes text or Enter to a chat/session. Tab moves focus to the scrollback;
+Tab again returns to this status composer. Existing scrollback grouping and
+status accents are retained, so contiguous calls keep Grok's chronological
+bracket structure while running, successful, and failed entries use the
+standard pending/success/error colors. The observer marks a new activity
+boundary after two minutes without a tool start; calls inside that window join
+the same native dense group even when their tool kinds differ. An approval
+marks the corresponding native tool entry as pending-user-input, which keeps
+its static purple accent until the approval resolves.
 
 `grok mcp server --workspace <path> --transport http --ui` creates the same
 `GatewaySession` and retained `GatewayServer` as headless mode, attaches a
 `ChannelApprovalBroker`, and gives the receiver to `LocalObserverBridge`.
 The bridge remains the transport-independent adapter: `GatewayEventBus` feeds
-its bounded, redacted observer stream; pressing `y` resolves the oldest pending
-approval as `AllowOnce` and `n` as `Deny`. On `q`, Escape, or terminal teardown
-the bridge disconnects and drops all pending senders, so pending calls deny
+its bounded, redacted observer stream; Up/Down selects `Allow once` or `Deny`
+and Enter resolves the oldest pending approval. On `q`, Escape, or terminal
+teardown the bridge disconnects and drops all pending senders, so pending calls deny
 before tool execution. The observer does not own a toolset and cannot call a
 tool directly; the only execution route remains `FinalizedToolset::call`.
 

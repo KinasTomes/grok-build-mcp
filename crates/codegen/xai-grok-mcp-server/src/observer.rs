@@ -11,7 +11,10 @@ use serde::Serialize;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::{ApprovalDecision, GatewayEvent, GatewayEventBus, PendingApproval};
+use crate::{
+    ApprovalDecision, GatewayEvent, GatewayEventBus, ObserverToolDetails, PendingApproval,
+    events::redact_observer_text,
+};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -33,6 +36,8 @@ pub struct ObserverEvent {
     pub call_id: Option<String>,
     pub tool_name: Option<String>,
     pub summary: Option<String>,
+    pub details: Option<ObserverToolDetails>,
+    pub output: Option<String>,
     pub duration_ms: Option<u128>,
     pub allowed: Option<bool>,
 }
@@ -131,6 +136,8 @@ impl LocalObserverBridge {
                             call_id: Some(request.call_id),
                             tool_name: Some(request.tool_name),
                             summary: Some(request.summary),
+                            details: None,
+                            output: None,
                             duration_ms: None,
                             allowed: None,
                         });
@@ -158,6 +165,8 @@ impl LocalObserverBridge {
                 call_id: None,
                 tool_name: None,
                 summary: None,
+                details: None,
+                output: None,
                 duration_ms: None,
                 allowed: None,
             },
@@ -166,21 +175,34 @@ impl LocalObserverBridge {
                 call_id: None,
                 tool_name: None,
                 summary: None,
+                details: None,
+                output: None,
                 duration_ms: None,
                 allowed: None,
             },
-            GatewayEvent::ToolCallStarted { call_id, tool_name } => {
+            GatewayEvent::ToolCallStarted {
+                call_id,
+                tool_name,
+                summary,
+                details,
+            } => {
                 started.insert(call_id.clone(), Instant::now());
                 ObserverEvent {
                     kind: ObserverEventKind::ToolStarted,
                     call_id: Some(call_id),
                     tool_name: Some(tool_name),
-                    summary: None,
+                    summary: Some(summary),
+                    details,
+                    output: None,
                     duration_ms: None,
                     allowed: None,
                 }
             }
-            GatewayEvent::ToolCallFinished { call_id, tool_name } => ObserverEvent {
+            GatewayEvent::ToolCallFinished {
+                call_id,
+                tool_name,
+                output,
+            } => ObserverEvent {
                 kind: ObserverEventKind::ToolFinished,
                 duration_ms: started
                     .remove(&call_id)
@@ -188,6 +210,8 @@ impl LocalObserverBridge {
                 call_id: Some(call_id),
                 tool_name: Some(tool_name),
                 summary: None,
+                details: None,
+                output,
                 allowed: None,
             },
             GatewayEvent::ToolCallFailed {
@@ -202,6 +226,8 @@ impl LocalObserverBridge {
                 call_id: Some(call_id),
                 tool_name: Some(tool_name),
                 summary: Some(redact_summary(&reason)),
+                details: None,
+                output: None,
                 allowed: None,
             },
             GatewayEvent::ApprovalRequested { call_id, tool_name } => ObserverEvent {
@@ -209,6 +235,8 @@ impl LocalObserverBridge {
                 call_id: Some(call_id),
                 tool_name: Some(tool_name),
                 summary: None,
+                details: None,
+                output: None,
                 duration_ms: None,
                 allowed: None,
             },
@@ -221,6 +249,8 @@ impl LocalObserverBridge {
                 call_id: Some(call_id),
                 tool_name: Some(tool_name),
                 summary: None,
+                details: None,
+                output: None,
                 duration_ms: None,
                 allowed: Some(allowed),
             },
@@ -236,35 +266,7 @@ impl LocalObserverBridge {
 /// Prevent common secret-bearing values from reaching a local webview. This is
 /// defense in depth: gateway events already avoid raw argument objects.
 pub fn redact_summary(summary: &str) -> String {
-    let bounded: String = summary.chars().take(240).collect();
-    let mut redact_next = false;
-    bounded
-        .split_whitespace()
-        .map(|word| {
-            if std::mem::take(&mut redact_next) {
-                return "[REDACTED]";
-            }
-            let lower = word.to_ascii_lowercase();
-            if lower == "--token"
-                || lower == "--password"
-                || lower == "--api-key"
-                || lower == "authorization:"
-            {
-                redact_next = true;
-                "[REDACTED]"
-            } else if lower.contains("token=")
-                || lower.contains("password=")
-                || lower.contains("secret=")
-                || lower.contains("authorization:")
-                || lower.contains("api_key=")
-            {
-                "[REDACTED]"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    redact_observer_text(summary, 240)
 }
 
 #[cfg(test)]

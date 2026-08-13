@@ -1487,6 +1487,38 @@ impl ScrollbackState {
         true
     }
 
+    /// Set whether an entry can join the preceding dense scrollback group.
+    ///
+    /// This changes only presentation grouping; it never reorders or hides a
+    /// tool call. It is useful to transcript producers that have an explicit
+    /// activity-session boundary unavailable to the generic pager.
+    pub fn set_dense_group_with_previous(&mut self, id: EntryId, joins: bool) -> bool {
+        let Some(entry) = self.get_by_id_mut(id) else {
+            return false;
+        };
+        if entry.dense_group_with_previous == joins {
+            return false;
+        }
+        entry.dense_group_with_previous = joins;
+        self.mark_structurally_dirty(id);
+        true
+    }
+
+    /// Allow a producer-defined chronological activity group to include tool
+    /// kinds which normally render as standalone rows (notably shell commands).
+    /// This only changes presentation grouping.
+    pub fn set_force_activity_group(&mut self, id: EntryId, enabled: bool) -> bool {
+        let Some(entry) = self.get_by_id_mut(id) else {
+            return false;
+        };
+        if entry.force_activity_group == enabled {
+            return false;
+        }
+        entry.force_activity_group = enabled;
+        self.mark_structurally_dirty(id);
+        true
+    }
+
     /// Clear the pending-user-input flag from every entry.
     ///
     /// Called by `AgentView` before re-syncing flags from the current

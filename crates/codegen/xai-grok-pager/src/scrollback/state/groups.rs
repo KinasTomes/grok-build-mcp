@@ -141,9 +141,24 @@ fn scan_verb_runs(
         return (spans, claimed);
     }
 
-    let entry_at = |i: usize| entries.get_index(i).map(|(_, e)| e);
     let mut i = 0;
     while i < n {
+        // A producer may deliberately begin a new activity group (the
+        // remote MCP observer does this after an idle window). Keep verb
+        // headers and dense spacing on the same side of that boundary.
+        let mut segment_end = i + 1;
+        while segment_end < n
+            && entries
+                .get_index(segment_end)
+                .is_some_and(|(_, entry)| entry.dense_group_with_previous)
+        {
+            segment_end += 1;
+        }
+        let entry_at = |index: usize| {
+            (index < segment_end)
+                .then(|| entries.get_index(index).map(|(_, entry)| entry))
+                .flatten()
+        };
         // Trailing transparent thinking stays outside the run (`scan.end`).
         let Some(scan) = scan_run_forward(entry_at, i, show_thinking) else {
             i += 1;
@@ -221,6 +236,9 @@ fn scan_truncations(
         let mut j = i + 1;
         while j < n {
             let (_, e) = entries.get_index(j).unwrap();
+            if !e.dense_group_with_previous {
+                break;
+            }
             if claimed[j] {
                 break;
             }

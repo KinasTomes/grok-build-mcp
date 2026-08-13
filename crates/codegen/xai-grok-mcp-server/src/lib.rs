@@ -10,6 +10,7 @@ mod policy;
 mod server;
 mod transport;
 
+pub use events::ObserverToolDetails;
 pub use policy::{GatewayPermission, GatewayPermissionDecision, ShellPolicy};
 pub use server::GatewayServer;
 pub use transport::{HttpGateway, MCP_HTTP_ENDPOINT};

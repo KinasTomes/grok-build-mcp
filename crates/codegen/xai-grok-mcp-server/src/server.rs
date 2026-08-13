@@ -119,6 +119,8 @@ impl ServerHandler for GatewayServer {
             .emit(GatewayEvent::ToolCallStarted {
                 call_id: call_id.clone(),
                 tool_name: tool_name.to_string(),
+                summary: observer_summary(tool_name, &arguments),
+                details: observer_details(tool_name, &arguments),
             });
 
         let input = match self
@@ -185,11 +187,13 @@ impl ServerHandler for GatewayServer {
             .await
         {
             Ok(result) => {
+                let output = observer_tool_output(&result.prompt_text);
                 self.session
                     .event_bus()
                     .emit(GatewayEvent::ToolCallFinished {
                         call_id,
                         tool_name: tool_name.to_string(),
+                        output,
                     });
                 Ok(CallToolResult::success(vec![ContentBlock::text(
                     result.prompt_text,
@@ -237,5 +241,109 @@ fn approval_summary(tool_name: &str, arguments: &serde_json::Value) -> String {
     match command {
         Some(command) => format!("{}", command.chars().take(240).collect::<String>()),
         None => format!("{tool_name} requires local approval"),
+    }
+}
+
+fn observer_summary(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let string = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| arguments.get(*name).and_then(serde_json::Value::as_str))
+    };
+    let path = || {
+        string(&[
+            "target_directory",
+            "target_file",
+            "directory",
+            "path",
+            "file_path",
+            "file",
+        ])
+    };
+    let summary = match tool_name {
+        "list_dir" | "ls" => path().map(str::to_owned),
+        "read_file" | "read" => path().map(str::to_owned),
+        "grep" | "search" => {
+            let target = string(&["path", "target_directory", "directory"]);
+            string(&["pattern", "query"]).map(|pattern| match target {
+                Some(target) => format!("{pattern:?} in {target}"),
+                None => format!("{pattern:?}"),
+            })
+        }
+        "glob" => string(&["pattern", "glob", "path"]).map(str::to_owned),
+        "run_terminal_cmd" | "run_terminal_command" | "bash" | "shell" | "execute" => {
+            string(&["command"]).map(str::to_owned)
+        }
+        "search_replace" | "edit" | "apply_patch" | "strreplace" | "write" => {
+            path().map(str::to_owned)
+        }
+        _ => {
+            string(&["command", "path", "file_path", "query", "pattern", "glob"]).map(str::to_owned)
+        }
+    };
+    crate::events::redact_observer_text(summary.as_deref().unwrap_or(tool_name), 240)
+}
+
+fn observer_details(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<crate::events::ObserverToolDetails> {
+    use crate::events::{ObserverToolDetails, redact_observer_multiline};
+
+    let string = |name| arguments.get(name).and_then(serde_json::Value::as_str);
+    let path = || {
+        string("file_path")
+            .or_else(|| string("target_file"))
+            .or_else(|| string("path"))
+    };
+    match tool_name {
+        "search_replace" | "edit" | "strreplace" => Some(ObserverToolDetails::Edit {
+            path: path()?.to_owned(),
+            old_text: redact_observer_multiline(string("old_string")?, 8 * 1024),
+            new_text: redact_observer_multiline(string("new_string")?, 8 * 1024),
+        }),
+        "write" => Some(ObserverToolDetails::Write {
+            path: path()?.to_owned(),
+            content: redact_observer_multiline(string("content")?, 8 * 1024),
+        }),
+        _ => None,
+    }
+}
+
+fn observer_tool_output(output: &str) -> Option<String> {
+    Some(crate::events::redact_observer_multiline(output, 8 * 1024))
+        .filter(|output| !output.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observer_summary;
+    use serde_json::json;
+
+    #[test]
+    fn observer_summary_uses_list_dir_target_directory() {
+        assert_eq!(
+            observer_summary("list_dir", &json!({"target_directory": ".grok/docs"})),
+            ".grok/docs"
+        );
+    }
+
+    #[test]
+    fn observer_summary_uses_read_file_target_file() {
+        assert_eq!(
+            observer_summary("read_file", &json!({"target_file": "/etc/os-release"})),
+            "/etc/os-release"
+        );
+    }
+
+    #[test]
+    fn observer_summary_keeps_search_target_and_pattern() {
+        assert_eq!(
+            observer_summary(
+                "grep",
+                &json!({"pattern": "approval", "path": ".grok/docs"}),
+            ),
+            "\"approval\" in .grok/docs"
+        );
     }
 }

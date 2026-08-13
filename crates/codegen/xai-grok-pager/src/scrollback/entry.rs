@@ -90,6 +90,23 @@ pub struct ScrollbackEntry {
     /// `question_view` state via `ScrollbackState::set_pending_user_input`.
     pub is_pending_user_input: bool,
 
+    /// Whether this entry may visually join the preceding dense tool group.
+    ///
+    /// Most transcript entries retain the historical behavior and join their
+    /// immediately preceding groupable neighbor. Alternate producers such as
+    /// the remote-MCP observer can opt out at a semantic activity boundary
+    /// (for example, after a long pause) without inventing a fake visible
+    /// transcript entry just to create whitespace.
+    pub dense_group_with_previous: bool,
+
+    /// Whether this entry may participate in a transcript-producer-defined
+    /// activity group even when its normal tool class would render alone.
+    ///
+    /// The remote MCP observer uses this for a single chronological burst of
+    /// mixed local tools (for example List, Read, then Run). Native agent
+    /// transcripts retain their existing grouping rules by default.
+    pub force_activity_group: bool,
+
     /// Current display mode.
     pub display_mode: DisplayMode,
 
@@ -191,6 +208,8 @@ impl ScrollbackEntry {
             block,
             is_running: false,
             is_pending_user_input: false,
+            dense_group_with_previous: true,
+            force_activity_group: false,
             display_mode,
             display_mode_pinned: false,
             raw: false,
@@ -223,6 +242,8 @@ impl ScrollbackEntry {
             block,
             is_running: true,
             is_pending_user_input: false,
+            dense_group_with_previous: true,
+            force_activity_group: false,
             display_mode,
             display_mode_pinned: false,
             raw: false,
