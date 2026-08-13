@@ -1,12 +1,11 @@
-name: Windows CI
+name: Windows Build
 
 on:
+  workflow_dispatch:
+
   push:
     branches:
       - main
-      - feat/**
-  pull_request:
-  workflow_dispatch:
 
 jobs:
   windows:
@@ -28,6 +27,8 @@ jobs:
         shell: powershell
         run: |
           choco install protoc -y
+          $protoc = (Get-Command protoc).Source
+          echo "PROTOC=$protoc" >> $env:GITHUB_ENV
           protoc --version
 
       - name: Cargo check
