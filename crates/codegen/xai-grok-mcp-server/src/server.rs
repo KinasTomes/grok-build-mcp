@@ -9,13 +9,23 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use xai_grok_tools::types::definition::ToolDefinition;
 
-use crate::{GatewayPermissionDecision, GatewaySession};
+use crate::{
+    ApprovalDecision, ApprovalRequest, GatewayEvent, GatewayPermissionDecision, GatewaySession,
+};
 
 /// MCP protocol adapter. Transport is intentionally outside this type so it
 /// can be used with stdio now and Streamable HTTP later.
 pub struct GatewayServer {
     session: Arc<GatewaySession>,
     call_sequence: AtomicU64,
+}
+
+impl Drop for GatewayServer {
+    fn drop(&mut self) {
+        self.session
+            .event_bus()
+            .emit(GatewayEvent::ClientDisconnected);
+    }
 }
 
 impl GatewayServer {
@@ -91,10 +101,20 @@ impl ServerHandler for GatewayServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: rmcp::service::RequestContext<RoleServer>,
+        context: rmcp::service::RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let tool_name = request.name.as_ref();
         let arguments = serde_json::Value::Object(request.arguments.unwrap_or_default());
+        let call_id = format!(
+            "mcp-gateway-{}",
+            self.call_sequence.fetch_add(1, Ordering::Relaxed)
+        );
+        self.session
+            .event_bus()
+            .emit(GatewayEvent::ToolCallStarted {
+                call_id: call_id.clone(),
+                tool_name: tool_name.to_string(),
+            });
 
         let input = match self
             .session
@@ -104,34 +124,104 @@ impl ServerHandler for GatewayServer {
         {
             Ok(input) => input,
             Err(error) => {
+                self.failed(&call_id, tool_name, "tool unavailable");
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Tool `{tool_name}` is not available: {error}"
                 ))]));
             }
         };
-        if self.session.permission().evaluate(tool_name, &input) != GatewayPermissionDecision::Allow
-        {
+        let decision = self.session.permission().evaluate(tool_name, &input);
+        if decision == GatewayPermissionDecision::Ask {
+            self.session
+                .event_bus()
+                .emit(GatewayEvent::ApprovalRequested {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.to_string(),
+                });
+            let approval = self
+                .session
+                .request_approval(
+                    ApprovalRequest {
+                        call_id: call_id.clone(),
+                        tool_name: tool_name.to_string(),
+                        summary: approval_summary(tool_name, &arguments),
+                    },
+                    context.ct.clone(),
+                )
+                .await;
+            let allowed = approval == ApprovalDecision::AllowOnce && !context.ct.is_cancelled();
+            self.session
+                .event_bus()
+                .emit(GatewayEvent::ApprovalResolved {
+                    call_id: call_id.clone(),
+                    tool_name: tool_name.to_string(),
+                    allowed,
+                });
+            if !allowed {
+                self.failed(
+                    &call_id,
+                    tool_name,
+                    "approval denied, timed out, or cancelled",
+                );
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "Tool `{tool_name}` was denied by the gateway approval policy"
+                ))]));
+            }
+        } else if decision != GatewayPermissionDecision::Allow {
+            self.failed(&call_id, tool_name, "permission denied");
             return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Tool `{tool_name}` was denied by the gateway permission policy"
             ))]));
         }
-
-        let call_id = format!(
-            "mcp-gateway-{}",
-            self.call_sequence.fetch_add(1, Ordering::Relaxed)
-        );
         match self
             .session
             .toolset()
             .call(tool_name, arguments, &call_id, None)
             .await
         {
-            Ok(result) => Ok(CallToolResult::success(vec![ContentBlock::text(
-                result.prompt_text,
-            )])),
-            Err(error) => Ok(CallToolResult::error(vec![ContentBlock::text(
-                error.to_string(),
-            )])),
+            Ok(result) => {
+                self.session
+                    .event_bus()
+                    .emit(GatewayEvent::ToolCallFinished {
+                        call_id,
+                        tool_name: tool_name.to_string(),
+                    });
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    result.prompt_text,
+                )]))
+            }
+            Err(error) => {
+                self.failed(&call_id, tool_name, "tool execution failed");
+                Ok(CallToolResult::error(vec![ContentBlock::text(
+                    error.to_string(),
+                )]))
+            }
         }
+    }
+
+    fn on_initialized(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleServer>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.session.event_bus().emit(GatewayEvent::ClientConnected);
+        std::future::ready(())
+    }
+}
+
+impl GatewayServer {
+    fn failed(&self, call_id: &str, tool_name: &str, reason: &str) {
+        self.session.event_bus().emit(GatewayEvent::ToolCallFailed {
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            reason: reason.to_string(),
+        });
+    }
+}
+
+fn approval_summary(tool_name: &str, arguments: &serde_json::Value) -> String {
+    let command = arguments.get("command").and_then(serde_json::Value::as_str);
+    match command {
+        Some(command) => format!("{}", command.chars().take(240).collect::<String>()),
+        None => format!("{tool_name} requires local approval"),
     }
 }

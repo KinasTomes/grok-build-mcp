@@ -1,9 +1,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use rmcp::ServiceExt;
-use xai_grok_mcp_server::{GatewayServer, GatewaySession, HttpGateway};
+use xai_grok_mcp_server::{GatewayServer, GatewaySession, HttpGateway, TerminalApprovalBroker};
 use xai_grok_sandbox::{ProfileName, SandboxManager};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -18,9 +19,10 @@ struct Args {
     transport: Transport,
     host: IpAddr,
     port: u16,
+    terminal_approval: bool,
 }
 
-const USAGE: &str = "usage: xai-grok-mcp-server --workspace <path> [--mcp-config <native-grok-config.toml>] [--transport stdio|http] [--host 127.0.0.1] [--port 8765]";
+const USAGE: &str = "usage: xai-grok-mcp-server --workspace <path> [--mcp-config <native-grok-config.toml>] [--transport stdio|http] [--host 127.0.0.1] [--port 8765] [--terminal-approval]";
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = std::env::args_os().skip(1);
@@ -29,6 +31,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut transport = Transport::Stdio;
     let mut host: IpAddr = "127.0.0.1".parse().expect("valid loopback address");
     let mut port = 8765;
+    let mut terminal_approval = false;
     while let Some(flag) = args.next() {
         match flag.to_string_lossy().as_ref() {
             "--workspace" => workspace = args.next().map(PathBuf::from),
@@ -52,6 +55,7 @@ fn parse_args() -> anyhow::Result<Args> {
                     .and_then(|value| value.parse().ok())
                     .ok_or_else(|| anyhow::anyhow!("--port must be a valid TCP port; {USAGE}"))?;
             }
+            "--terminal-approval" => terminal_approval = true,
             _ => anyhow::bail!("{USAGE}"),
         }
     }
@@ -61,6 +65,7 @@ fn parse_args() -> anyhow::Result<Args> {
         transport,
         host,
         port,
+        terminal_approval,
     })
 }
 
@@ -85,6 +90,16 @@ async fn main() -> anyhow::Result<()> {
     let session = match args.mcp_config {
         Some(config) => GatewaySession::with_native_mcp_config(&workspace, config).await?,
         None => GatewaySession::new(&workspace)?,
+    };
+    if args.terminal_approval && args.transport == Transport::Stdio {
+        anyhow::bail!(
+            "--terminal-approval is only supported with --transport http; stdin/stdout belong to MCP stdio"
+        );
+    }
+    let session = if args.terminal_approval {
+        session.with_approval_broker(Arc::new(TerminalApprovalBroker))
+    } else {
+        session
     };
     let downstream_count = session.downstream_server_count().await;
     let tool_count = session.toolset().tool_definitions().len();

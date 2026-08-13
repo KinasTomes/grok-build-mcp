@@ -217,3 +217,27 @@ transport accepts calls.
 External web clients still need deployment security before use beyond a local
 trusted machine: TLS termination, authentication/authorization, an intentional
 public Host/Origin policy, and a safe tunnel or relay are not provided here.
+
+## Phase 5 implementation: events and local approval
+
+The gateway has a transport-neutral bounded broadcast event bus. It exposes
+`ClientConnected`, `ClientDisconnected`, `ToolCallStarted`, `ToolCallFinished`,
+`ToolCallFailed`, `ApprovalRequested`, and `ApprovalResolved`. Events contain
+the call ID and tool name, not full arguments or tool output. Slow observers
+are lossy (`broadcast` lag) rather than a source of tool-call backpressure.
+
+`GatewayPermission` now returns `Allow`, `Ask`, or `Deny`. Workspace-safe file
+operations, read-only downstream tools, and the existing shell allowlist stay
+Allow. Shell commands such as `cargo check`, `cargo test`, `cargo build`, Go
+tests, and npm/pnpm tests are Ask; operators/pipelines and clear destructive
+commands (`rm`, `sudo`, `dd`, `mkfs`, mutating Git, privilege/process and
+ownership commands) are Deny. Ask is fail-closed unless a local
+`ApprovalBroker` is attached. It has only `AllowOnce` and `Deny`, uses a
+conservative 60-second default timeout, and races both timeout and MCP request
+cancellation to Deny before dispatch.
+
+`--terminal-approval` supplies a development-only broker that prompts via
+stderr/stdin. It is intentionally rejected with stdio MCP transport so MCP
+stdout is never corrupted; use it only with `--transport http`. A future local
+observer/approval UI can subscribe to the same event bus and implement another
+broker without changing permission or transport code.

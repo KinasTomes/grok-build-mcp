@@ -3,6 +3,8 @@
 //! It deliberately owns an [`Arc<FinalizedToolset>`] directly rather than an
 //! agent, sampler, ACP session, or prompt loop.
 
+mod approval;
+mod events;
 mod policy;
 mod server;
 mod transport;
@@ -33,6 +35,9 @@ pub struct GatewaySession {
     workspace: PathBuf,
     toolset: Arc<FinalizedToolset>,
     permission: GatewayPermission,
+    events: GatewayEventBus,
+    approval_broker: Option<Arc<dyn ApprovalBroker>>,
+    approval_timeout: std::time::Duration,
     terminal_backend: Arc<xai_grok_tools::computer::local::LocalTerminalBackend>,
     /// Retains downstream clients for as long as dynamic `McpErasedTool`s can run.
     _mcp_state: Option<Arc<Mutex<xai_grok_mcp::servers::McpState>>>,
@@ -119,6 +124,9 @@ impl GatewaySession {
             workspace: workspace.clone(),
             toolset: Arc::new(toolset),
             permission: GatewayPermission::coding_default(workspace.clone()),
+            events: GatewayEventBus::default(),
+            approval_broker: None,
+            approval_timeout: std::time::Duration::from_secs(60),
             terminal_backend,
             _mcp_state: None,
         })
@@ -192,6 +200,35 @@ impl GatewaySession {
         &self.permission
     }
 
+    pub fn event_bus(&self) -> &GatewayEventBus {
+        &self.events
+    }
+
+    /// Attach a local approval consumer. Without one, Ask remains deny.
+    pub fn with_approval_broker(mut self, broker: Arc<dyn ApprovalBroker>) -> Self {
+        self.approval_broker = Some(broker);
+        self
+    }
+
+    pub fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.approval_timeout = timeout;
+        self
+    }
+
+    pub(crate) async fn request_approval(
+        &self,
+        request: ApprovalRequest,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> ApprovalDecision {
+        let Some(broker) = &self.approval_broker else {
+            return ApprovalDecision::Deny;
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => ApprovalDecision::Deny,
+            result = tokio::time::timeout(self.approval_timeout, broker.request(request)) => result.unwrap_or(ApprovalDecision::Deny),
+        }
+    }
+
     /// Number of configured downstream MCP servers that completed startup.
     pub async fn downstream_server_count(&self) -> usize {
         match &self._mcp_state {
@@ -211,3 +248,40 @@ impl GatewaySession {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_approval_wait_fails_closed_before_a_late_response() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let (broker, mut pending) = ChannelApprovalBroker::new(1);
+        let session = GatewaySession::new(workspace.path())
+            .unwrap()
+            .with_approval_broker(broker)
+            .with_approval_timeout(std::time::Duration::from_secs(1));
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let wait = session.request_approval(
+            ApprovalRequest {
+                call_id: "call".into(),
+                tool_name: "run_terminal_cmd".into(),
+                summary: "cargo test".into(),
+            },
+            cancellation.clone(),
+        );
+        tokio::pin!(wait);
+        let request = tokio::select! {
+            request = pending.recv() => request.unwrap(),
+            _ = &mut wait => panic!("approval resolved before a consumer responded"),
+        };
+        cancellation.cancel();
+        assert_eq!(wait.as_mut().await, ApprovalDecision::Deny);
+        request.resolve(ApprovalDecision::AllowOnce);
+    }
+}
+pub use approval::{
+    ApprovalBroker, ApprovalDecision, ApprovalRequest, ChannelApprovalBroker, PendingApproval,
+    TerminalApprovalBroker,
+};
+pub use events::{GatewayEvent, GatewayEventBus};

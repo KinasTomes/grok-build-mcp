@@ -4,11 +4,11 @@ use std::sync::{Arc, RwLock};
 
 use xai_grok_tools::types::ToolInput;
 
-/// Non-interactive, fail-closed gateway permission policy.
+/// Gateway permission policy over parsed Grok tool input.
 ///
 /// It classifies the parsed Grok `ToolInput` before dispatch. The shell's ACP
-/// permission prompt is intentionally not imported: an `Ask` decision has no
-/// safe resolution on an MCP stdio connection, so it is always a denial here.
+/// permission prompt is intentionally not imported. A host may resolve `Ask`
+/// through its own local approval broker; without one the server denies it.
 #[derive(Debug, Clone)]
 pub struct GatewayPermission {
     workspace: PathBuf,
@@ -19,6 +19,7 @@ pub struct GatewayPermission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayPermissionDecision {
     Allow,
+    Ask,
     Deny,
 }
 
@@ -52,29 +53,38 @@ impl GatewayPermission {
     }
 
     pub fn evaluate(&self, requested_name: &str, input: &ToolInput) -> GatewayPermissionDecision {
-        let allowed = match input {
-            ToolInput::ReadFile(read) => self.workspace_path(&read.path),
-            ToolInput::ListDir(list) => self.workspace_path(&list.target_directory),
+        match input {
+            ToolInput::ReadFile(read) => self.path_decision(&read.path),
+            ToolInput::ListDir(list) => self.path_decision(&list.target_directory),
             ToolInput::Grep(grep) => grep
                 .path
                 .as_deref()
-                .is_none_or(|path| self.workspace_path(path)),
-            ToolInput::SearchReplace(edit) => self.workspace_path(&edit.file_path),
-            ToolInput::Bash(bash) => self.shell_allowed(&bash.command),
+                .map_or(GatewayPermissionDecision::Allow, |path| {
+                    self.path_decision(path)
+                }),
+            ToolInput::SearchReplace(edit) => self.path_decision(&edit.file_path),
+            ToolInput::Bash(bash) => self.shell_decision(&bash.command),
             // Background output is read-only and can only observe commands
             // created by an admitted `run_terminal_cmd` in this toolset.
-            ToolInput::TaskOutput(_) => true,
+            ToolInput::TaskOutput(_) => GatewayPermissionDecision::Allow,
             // Dynamically registered MCP tools parse as Dynamic. Only tools
             // discovered from an explicitly configured downstream server are
             // admitted; arbitrary/unclassified dynamic calls fail closed.
-            ToolInput::Dynamic(_) | ToolInput::MCPTool(_) => self
-                .downstream_tools
-                .read()
-                .expect("permission lock poisoned")
-                .contains(requested_name),
-            _ => false,
-        };
-        allowed
+            ToolInput::Dynamic(_) | ToolInput::MCPTool(_)
+                if self
+                    .downstream_tools
+                    .read()
+                    .expect("permission lock poisoned")
+                    .contains(requested_name) =>
+            {
+                GatewayPermissionDecision::Allow
+            }
+            _ => GatewayPermissionDecision::Deny,
+        }
+    }
+
+    fn path_decision(&self, candidate: &str) -> GatewayPermissionDecision {
+        self.workspace_path(candidate)
             .then_some(GatewayPermissionDecision::Allow)
             .unwrap_or(GatewayPermissionDecision::Deny)
     }
@@ -91,19 +101,45 @@ impl GatewayPermission {
         normalize_lexically(&resolved).starts_with(&self.workspace)
     }
 
-    fn shell_allowed(&self, command: &str) -> bool {
-        if self.shell_policy == ShellPolicy::DenyAll
-            || command.contains([';', '|', '&', '>', '<', '`', '\n'])
-        {
-            return false;
+    fn shell_decision(&self, command: &str) -> GatewayPermissionDecision {
+        if self.shell_policy == ShellPolicy::DenyAll {
+            return GatewayPermissionDecision::Deny;
+        }
+        if command.contains([';', '|', '&', '>', '<', '`', '\n']) || destructive_command(command) {
+            return GatewayPermissionDecision::Deny;
         }
         let mut words = command.split_whitespace();
-        match words.next() {
+        let safe = match words.next() {
             Some("pwd") => words.next().is_none(),
             Some("ls") | Some("rg") => true,
             Some("git") => matches!(words.next(), Some("status" | "diff" | "log" | "show")),
             _ => false,
+        };
+        if safe {
+            GatewayPermissionDecision::Allow
+        } else {
+            GatewayPermissionDecision::Ask
         }
+    }
+}
+
+fn destructive_command(command: &str) -> bool {
+    let words: Vec<_> = command.split_whitespace().collect();
+    match words.as_slice() {
+        ["rm", ..]
+        | ["sudo", ..]
+        | ["dd", ..]
+        | ["mkfs", ..]
+        | ["shutdown", ..]
+        | ["reboot", ..]
+        | ["kill", ..]
+        | ["pkill", ..]
+        | ["chmod", ..]
+        | ["chown", ..]
+        | ["curl", ..]
+        | ["wget", ..] => true,
+        ["git", "reset", ..] | ["git", "clean", ..] | ["git", "checkout", ..] => true,
+        _ => false,
     }
 }
 
