@@ -1909,6 +1909,17 @@ fn main() {
 }
 async fn async_main(args: PagerArgs) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+    // `grok mcp server --workspace` is a gateway-owned workspace, not an
+    // agent prompt option. Apply it before the process-wide sandbox is set up
+    // below, while preserving an explicit top-level `--cwd` if supplied.
+    let mut args = args;
+    if args.cwd.is_none()
+        && let Some(Command::Mcp(xai_grok_pager::mcp_cmd::McpArgs {
+            command: xai_grok_pager::mcp_cmd::McpCommand::Server(server),
+        })) = args.command.as_ref()
+    {
+        args.cwd = server.workspace.clone();
+    }
     let mut args = args.apply_cwd()?;
     if let Some(ref mode) = args.compaction_mode {
         unsafe { std::env::set_var("GROK_COMPACTION_MODE", mode) };

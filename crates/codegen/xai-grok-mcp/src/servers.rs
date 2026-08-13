@@ -3896,14 +3896,15 @@ impl McpClient {
         &self,
         mcp_state: Arc<Mutex<McpState>>,
     ) -> Result<Vec<McpToolRegistration>, McpError> {
-        let _ensure_init_timer =
-            xai_grok_telemetry::instrumentation::timer("mcp_ensure_initialized");
+        // Keep this future `Send`: standalone hosts refresh a downstream
+        // catalog from a spawned lifecycle task. `InstrumentationTimer` holds
+        // a tracing entered span and therefore cannot live across these I/O
+        // awaits.
         let mcp_service = self.ensure_initialized().await?;
 
         let mut all_tools = Vec::new();
         let mut cursor: Option<String> = None;
 
-        let _list_tools_timer = xai_grok_telemetry::instrumentation::timer("mcp_list_tools");
         loop {
             let list_tools_result = mcp_service
                 .list_tools(Some(

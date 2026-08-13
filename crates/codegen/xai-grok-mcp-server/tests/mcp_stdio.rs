@@ -1,7 +1,10 @@
 use rmcp::model::{CallToolRequestParams, ClientInfo};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{ClientHandler, ServiceExt};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::TempDir;
+use tokio::sync::Notify;
 use xai_grok_mcp_server::{
     ApprovalDecision, ChannelApprovalBroker, GatewayEvent, GatewayPermissionDecision,
     GatewayServer, GatewaySession, HttpGateway, READ_FILE_TOOL,
@@ -13,6 +16,27 @@ struct TestClient;
 impl ClientHandler for TestClient {
     fn get_info(&self) -> ClientInfo {
         ClientInfo::default()
+    }
+}
+
+#[derive(Clone, Default)]
+struct ListChangedClient {
+    notifications: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+}
+
+impl ClientHandler for ListChangedClient {
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::default()
+    }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<rmcp::RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + Send + '_ {
+        self.notifications.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+        std::future::ready(())
     }
 }
 
@@ -77,6 +101,173 @@ async fn start_http_gateway_session(
         .await
         .expect("HTTP MCP initialize should succeed");
     (gateway, client)
+}
+
+async fn write_mutable_downstream(workspace: &TempDir) -> std::path::PathBuf {
+    let script = workspace.path().join("mutable-downstream.py");
+    std::fs::write(&script, r#"import json, sys
+catalog = 0
+def tools():
+    if catalog == 0:
+        return [
+            {"name":"switch","description":"switch the fixture catalog","inputSchema":{"type":"object","properties":{}}},
+            {"name":"legacy","description":"legacy tool","inputSchema":{"type":"object","properties":{}}},
+            {"name":"mutable","description":"mutable v1","inputSchema":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}},
+        ]
+    return [
+        {"name":"switch","description":"switch the fixture catalog","inputSchema":{"type":"object","properties":{}}},
+        {"name":"mutable","description":"mutable v2","inputSchema":{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}},
+        {"name":"added","description":"newly added tool","inputSchema":{"type":"object","properties":{}}},
+    ]
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    changed = False
+    if method == "initialize":
+        result = {"protocolVersion":"2025-03-26","capabilities":{"tools":{"listChanged":True}},"serverInfo":{"name":"mutable","version":"1"}}
+    elif method == "tools/list":
+        result = {"tools":tools()}
+    elif method == "tools/call":
+        name = request["params"]["name"]
+        if name == "switch":
+            catalog = 1
+            changed = True
+        result = {"content":[{"type":"text","text":"called:" + name}]}
+    else:
+        result = {}
+    if "id" in request:
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}), flush=True)
+    if changed:
+        print(json.dumps({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}), flush=True)
+"#).unwrap();
+    let config = workspace.path().join("mutable-mcp.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[mcp_servers.fixture]\ncommand = \"python3\"\nargs = [\"{}\"]\n",
+            script.display()
+        ),
+    )
+    .unwrap();
+    config
+}
+
+async fn assert_dynamic_catalog_refresh(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ListChangedClient>,
+    observer: &ListChangedClient,
+) {
+    let before = client.list_tools(None).await.unwrap();
+    assert!(
+        before
+            .tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == "fixture__legacy")
+    );
+    let changed = observer.changed.notified();
+    let switch = client
+        .call_tool(CallToolRequestParams::new("fixture__switch"))
+        .await
+        .unwrap();
+    assert_eq!(switch.is_error, Some(false));
+    tokio::time::timeout(std::time::Duration::from_secs(3), changed)
+        .await
+        .expect("outer gateway must forward tools/list_changed");
+    let after = client.list_tools(None).await.unwrap();
+    assert!(
+        !after
+            .tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == "fixture__legacy")
+    );
+    assert!(
+        after
+            .tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == "fixture__added")
+    );
+    let mutable = after
+        .tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "fixture__mutable")
+        .unwrap();
+    assert_eq!(mutable.description.as_deref(), Some("mutable v2"));
+    assert_eq!(
+        mutable.input_schema["properties"]["count"]["type"],
+        "integer"
+    );
+    let updated_call = client
+        .call_tool(
+            CallToolRequestParams::new("fixture__mutable")
+                .with_arguments(serde_json::json!({"count": 1}).as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated_call.is_error, Some(false));
+    let disappeared = client
+        .call_tool(CallToolRequestParams::new("fixture__legacy"))
+        .await
+        .unwrap();
+    assert_eq!(disappeared.is_error, Some(true));
+    // A repeated notification must not duplicate the retained registration.
+    client
+        .call_tool(CallToolRequestParams::new("fixture__switch"))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let repeated = client.list_tools(None).await.unwrap();
+    assert_eq!(
+        repeated
+            .tools
+            .iter()
+            .filter(|tool| tool.name.as_ref() == "fixture__mutable")
+            .count(),
+        1
+    );
+    assert_eq!(observer.notifications.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn downstream_list_changed_refreshes_stdio_and_notifies_outer_client() {
+    let workspace = TempDir::new().unwrap();
+    let config = write_mutable_downstream(&workspace).await;
+    let session = GatewaySession::with_native_mcp_config(workspace.path(), config)
+        .await
+        .unwrap();
+    let server = GatewayServer::new(session);
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let _ = server
+            .serve(server_transport)
+            .await
+            .unwrap()
+            .waiting()
+            .await;
+    });
+    let observer = ListChangedClient::default();
+    let client = observer.clone().serve(client_transport).await.unwrap();
+    assert_dynamic_catalog_refresh(&client, &observer).await;
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn downstream_list_changed_refreshes_http_and_notifies_outer_client() {
+    let workspace = TempDir::new().unwrap();
+    let config = write_mutable_downstream(&workspace).await;
+    let session = GatewaySession::with_native_mcp_config(workspace.path(), config)
+        .await
+        .unwrap();
+    let gateway = HttpGateway::bind(GatewayServer::new(session), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let observer = ListChangedClient::default();
+    let client = observer
+        .clone()
+        .serve(StreamableHttpClientTransport::from_uri(gateway.endpoint()))
+        .await
+        .unwrap();
+    assert_dynamic_catalog_refresh(&client, &observer).await;
+    client.cancel().await.unwrap();
+    gateway.shutdown().await.unwrap();
 }
 
 #[tokio::test]

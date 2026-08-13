@@ -241,3 +241,85 @@ stderr/stdin. It is intentionally rejected with stdio MCP transport so MCP
 stdout is never corrupted; use it only with `--transport http`. A future local
 observer/approval UI can subscribe to the same event bus and implement another
 broker without changing permission or transport code.
+
+## Phase 6 implementation: dynamic downstream MCP refresh
+
+The gateway retains the original `Arc<FinalizedToolset>` and adds no second
+registry. A `DownstreamRuntime` records only the qualified tool names and a
+description/schema fingerprint for each configured server. `McpClient` already
+forwards downstream `notifications/tools/list_changed` as
+`McpClientEvent::ToolsChanged`; the gateway wires that event channel before its
+initial `tools/list`, then refreshes that server through
+`McpClient::get_tool_registrations`.
+
+The refresh fetches over the network without holding the registration lock. It
+then diffs the new registrations against the one server's recorded snapshot:
+removed names are unregistered, new names are registered, and changed schema or
+description fingerprints are replaced. The only dynamic path remains
+`FinalizedToolset::register_tool` / `unregister_tool_by_name`, so subsequent
+outer calls—including all downstream calls—still dispatch exclusively through
+`FinalizedToolset::call`. Qualified names remain `<server>__<tool>`. A duplicate
+within a server, a name outside that server's qualified prefix, or a collision
+with another server or an existing built-in rejects the refresh before changing
+the catalog.
+
+After a successful visible change, the gateway replaces the permission set with
+the union of currently registered downstream names and broadcasts a catalog
+change. Each initialized `GatewayServer` handler subscribes independently and
+sends the standard outer `notifications/tools/list_changed` through its own
+rmcp peer. This is identical for stdio and Streamable HTTP; stdio remains
+protocol-clean because the notification is emitted by rmcp rather than stdout
+logging.
+
+On a downstream transport close or handshake failure, the gateway removes that
+server's registrations and emits the same outer notification. HTTP/ACP clients
+use the existing `McpClient::recover` path and re-register their current tools
+after reconnect; a closed stdio child cannot be recreated by the shared MCP
+runtime and remains unavailable until a future configuration/restart feature.
+In-flight calls use the retained toolset lookup and therefore either complete
+against the tool they already resolved or fail as an unavailable tool; they are
+never redirected to another execution path. Refresh synchronization is limited
+to the short local diff/apply section and is never held during downstream I/O or
+normal tool execution.
+
+## Phase 7 redirect: existing Grok CLI/TUI observer mode
+
+The separate Tauri experiment was removed. The product surface is now the
+existing `grok` binary (`xai-grok-pager-bin`), whose command parser is
+`xai-grok-pager::app::cli::Command`, command dispatch is `async_main` in the
+same binary, and terminal UI framework is the existing `xai-grok-pager` crate.
+The normal application view is `app::AppView`; its update loop is
+`app::event_loop`, per-session state is `app::AgentView`, tool lifecycle is
+represented by `scrollback::blocks::tool`, and permission state/render/input
+is `views::permission_view` plus `app::agent_view::interactions`. Header and
+status affordances are supplied by the existing `views::status_bar` and
+`app::status_blocks` modules; ordinary text input belongs to
+`views::prompt_widget` and `app::agent_view::input`.
+
+The normal agent-owned scrollback and interaction controllers consume
+`AcpSession` request IDs and prompt queues, so observer mode deliberately does
+not construct `AppView` or `AgentView`. It does reuse the pager binary,
+terminal lifecycle, crossterm/ratatui renderer stack, theme, and the existing
+`render_permission_view` renderer. A short-lived display-only
+`PermissionViewState` is translated from the redacted gateway event; its ACP
+sender is never used, and `LocalObserverBridge` remains the only approval
+authority. The scrollback area contains only remote tool calls (running,
+succeeded, or failed), styled with the same Grok tool-call visual language.
+There is no `PromptWidget`, slash routing, prompt submission path, local model
+label, or transcript.
+
+`grok mcp server --workspace <path> --transport http --ui` creates the same
+`GatewaySession` and retained `GatewayServer` as headless mode, attaches a
+`ChannelApprovalBroker`, and gives the receiver to `LocalObserverBridge`.
+The bridge remains the transport-independent adapter: `GatewayEventBus` feeds
+its bounded, redacted observer stream; pressing `y` resolves the oldest pending
+approval as `AllowOnce` and `n` as `Deny`. On `q`, Escape, or terminal teardown
+the bridge disconnects and drops all pending senders, so pending calls deny
+before tool execution. The observer does not own a toolset and cannot call a
+tool directly; the only execution route remains `FinalizedToolset::call`.
+
+The headless command remains available without `--ui` for both stdio and HTTP;
+`--terminal-approval` remains the HTTP-only development fallback. `--ui` is
+HTTP-only because stdio is reserved for MCP protocol input/output. This mode
+does not create `AcpSession`, a sampler, a Grok provider, an agent, or a prompt
+loop.

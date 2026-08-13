@@ -45,11 +45,11 @@ impl GatewayPermission {
         }
     }
 
-    pub fn allow_downstream_tool(&self, name: String) {
+    pub fn replace_downstream_tools(&self, names: HashSet<String>) {
         self.downstream_tools
             .write()
             .expect("permission lock poisoned")
-            .insert(name);
+            .clone_from(&names);
     }
 
     pub fn evaluate(&self, requested_name: &str, input: &ToolInput) -> GatewayPermissionDecision {

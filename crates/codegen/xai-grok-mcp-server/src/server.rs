@@ -78,7 +78,12 @@ impl GatewayServer {
 
 impl ServerHandler for GatewayServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
             .with_server_info(Implementation::new(
                 "xai-grok-mcp-server",
                 env!("CARGO_PKG_VERSION"),
@@ -201,9 +206,18 @@ impl ServerHandler for GatewayServer {
 
     fn on_initialized(
         &self,
-        _context: rmcp::service::NotificationContext<RoleServer>,
+        context: rmcp::service::NotificationContext<RoleServer>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
         self.session.event_bus().emit(GatewayEvent::ClientConnected);
+        let mut catalog_changes = self.session.subscribe_catalog_changes();
+        let peer = context.peer.clone();
+        tokio::spawn(async move {
+            while catalog_changes.recv().await.is_ok() {
+                if peer.notify_tool_list_changed().await.is_err() {
+                    break;
+                }
+            }
+        });
         std::future::ready(())
     }
 }

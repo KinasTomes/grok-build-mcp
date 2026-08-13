@@ -111,6 +111,8 @@ xai-grok-plugin-marketplace = { path = "../xai-grok-plugin-marketplace" }
 xai-hooks-plugins-types = { path = "../xai-hooks-plugins-types" }
 walkdir = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
+xai-grok-mcp-server = { path = "../xai-grok-mcp-server" }
+rmcp = { version = "2.1", default-features = false, features = ["server", "transport-io"] }
 
 # Base64 encoding for image data
 base64 = { workspace = true }
