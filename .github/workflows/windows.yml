@@ -32,14 +32,25 @@ jobs:
           protoc --version
 
       - name: Build Windows release
-        run: cargo build --release -p xai-grok-mcp-server
+        run: cargo build --release -p xai-grok-pager-bin
 
-      - name: Smoke test gateway CLI
+      - name: Smoke test Grok MCP commands
         shell: powershell
-        run: .\target\release\xai-grok-mcp-server.exe --help
+        run: |
+          .\target\release\xai-grok-pager.exe --help
+          .\target\release\xai-grok-pager.exe mcp server --help
 
-      - name: Upload Windows binary
+      - name: Package Windows binaries
+        shell: powershell
+        run: |
+          $dist = "target\release\dist"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          # `grok.exe` is the full Grok Build CLI. `mcp server` starts its
+          # observer TUI by default; `--headless` disables it.
+          Copy-Item target\release\xai-grok-pager.exe "$dist\grok.exe"
+
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: xai-grok-mcp-server-windows-x64
-          path: target/release/xai-grok-mcp-server.exe
+          name: grok-build-mcp-windows-x64
+          path: target/release/dist

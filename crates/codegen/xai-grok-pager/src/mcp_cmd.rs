@@ -125,11 +125,12 @@ pub struct GatewayServerArgs {
     /// HTTP port.
     #[arg(long, default_value_t = 8765)]
     pub port: u16,
-    /// Show the existing Grok terminal activity/approval surface. HTTP only.
+    /// Run without the Grok Build activity and approval UI. Required for
+    /// stdio, whose terminal streams belong to the MCP client.
     #[arg(long)]
-    pub ui: bool,
+    pub headless: bool,
     /// Use the existing terminal approval fallback instead of the observer UI.
-    #[arg(long, conflicts_with = "ui")]
+    #[arg(long)]
     pub terminal_approval: bool,
 }
 
@@ -199,8 +200,8 @@ pub async fn run(mcp_args: McpArgs) -> Result<()> {
 }
 
 async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
-    if args.ui && args.transport != GatewayTransport::Http {
-        bail!("--ui is only supported with --transport http; stdio belongs to the MCP client");
+    if !args.headless && args.transport != GatewayTransport::Http {
+        bail!("the Grok Build observer requires --transport http; pass --headless for stdio");
     }
     if args.terminal_approval && args.transport != GatewayTransport::Http {
         bail!("--terminal-approval is only supported with --transport http");
@@ -213,7 +214,9 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
         None => xai_grok_mcp_server::GatewaySession::new(&workspace)?,
     };
 
-    if args.ui {
+    // HTTP starts in observer mode by default. A terminal-approval broker is
+    // intentionally a headless fallback, so it suppresses the full-screen UI.
+    if !args.headless && !args.terminal_approval {
         let (broker, approvals) = xai_grok_mcp_server::ChannelApprovalBroker::new(32);
         let session = session.with_approval_broker(broker);
         let server = xai_grok_mcp_server::GatewayServer::new(session);
