@@ -22,7 +22,7 @@ struct Args {
     terminal_approval: bool,
 }
 
-const USAGE: &str = "usage: xai-grok-mcp-server --workspace <path> [--mcp-config <native-grok-config.toml>] [--transport stdio|http] [--host 127.0.0.1] [--port 8765] [--terminal-approval]";
+const USAGE: &str = "usage: xai-grok-mcp-server --workspace <path> [--mcp-config <native-grok-config.toml>] [--transport stdio|http] [--host 127.0.0.1] [--port 8765] [--terminal-approval] [--help]";
 
 fn parse_args() -> anyhow::Result<Args> {
     let mut args = std::env::args_os().skip(1);
@@ -82,6 +82,13 @@ fn initialize_sandbox(workspace: &std::path::Path) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args_os()
+        .skip(1)
+        .any(|arg| matches!(arg.to_string_lossy().as_ref(), "--help" | "-h"))
+    {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let args = parse_args()?;
     let workspace = std::fs::canonicalize(&args.workspace)
         .with_context(|| format!("invalid workspace: {}", args.workspace.display()))?;

@@ -34,10 +34,9 @@ jobs:
       - name: Build Windows release
         run: cargo build --release -p xai-grok-mcp-server
 
-      - name: Smoke test binary
+      - name: Smoke test gateway CLI
         shell: powershell
-        run: |
-          .\target\release\xai-grok-mcp-server.exe --help
+        run: .\target\release\xai-grok-mcp-server.exe --help
 
       - name: Upload Windows binary
         uses: actions/upload-artifact@v4
