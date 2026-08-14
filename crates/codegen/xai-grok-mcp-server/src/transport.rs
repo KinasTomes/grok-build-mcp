@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::Context;
+use axum::{extract::Request, middleware::Next, response::Response};
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
     streamable_http_server::session::local::LocalSessionManager,
@@ -25,6 +27,18 @@ pub struct HttpGateway {
 impl HttpGateway {
     /// Bind the shared gateway session at [`MCP_HTTP_ENDPOINT`].
     pub async fn bind(server: GatewayServer, address: SocketAddr) -> anyhow::Result<Self> {
+        Self::bind_with_stateful(server, address, true).await
+    }
+
+    /// Bind the shared gateway session at [`MCP_HTTP_ENDPOINT`].
+    ///
+    /// Stateless mode is useful for MCP clients which issue discovery requests
+    /// before their `initialize` request and therefore have no session ID yet.
+    pub async fn bind_with_stateful(
+        server: GatewayServer,
+        address: SocketAddr,
+        stateful: bool,
+    ) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
             .with_context(|| format!("failed to bind MCP HTTP listener at {address}"))?;
@@ -40,6 +54,7 @@ impl HttpGateway {
             // inferred from a bound IP, so that deployment owns Host checks.
             StreamableHttpServerConfig::default().disable_allowed_hosts()
         }
+        .with_stateful_mode(stateful)
         .with_cancellation_token(shutdown.child_token());
         let service = StreamableHttpService::new(
             move || {
@@ -50,7 +65,11 @@ impl HttpGateway {
             Arc::new(LocalSessionManager::default()),
             config,
         );
-        let app = axum::Router::new().nest_service(MCP_HTTP_ENDPOINT, service);
+        let app = axum::Router::new()
+            .nest_service(MCP_HTTP_ENDPOINT, service)
+            // Keep this deliberately header-only: MCP requests often contain
+            // source code and tool arguments, which must not enter logs.
+            .layer(axum::middleware::from_fn(log_mcp_http_request));
         let server_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -81,6 +100,47 @@ impl HttpGateway {
         self.session.shutdown().await;
         Ok(())
     }
+}
+
+/// Emit request metadata needed to diagnose remote MCP client compatibility.
+///
+/// This is intentionally at `info` level so it is available with the CLI's
+/// normal tracing setup. Do not add request/response bodies here: they can
+/// contain workspace data or tool arguments.
+async fn log_mcp_http_request(request: Request, next: Next) -> Response {
+    let started = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let headers = request.headers();
+    let accept = header_value(headers, "accept");
+    let content_type = header_value(headers, "content-type");
+    let host = header_value(headers, "host");
+    let origin = header_value(headers, "origin");
+    let user_agent = header_value(headers, "user-agent");
+    let mcp_session_id = header_value(headers, "mcp-session-id");
+
+    let response = next.run(request).await;
+    tracing::info!(
+        method = %method,
+        path,
+        status = %response.status(),
+        elapsed_ms = started.elapsed().as_millis(),
+        accept = ?accept,
+        content_type = ?content_type,
+        host = ?host,
+        origin = ?origin,
+        user_agent = ?user_agent,
+        mcp_session_id = ?mcp_session_id,
+        "MCP HTTP request"
+    );
+    response
+}
+
+fn header_value(headers: &axum::http::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 fn allowed_hosts(address: SocketAddr) -> Vec<String> {

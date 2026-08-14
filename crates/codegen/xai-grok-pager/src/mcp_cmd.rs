@@ -29,6 +29,27 @@ Examples:
   # Add to the project config (./.grok/config.toml) instead of ~/.grok/config.toml
   grok mcp add --scope project github -- npx -y @modelcontextprotocol/server-github";
 
+const GATEWAY_SERVER_AFTER_HELP: &str = "\
+HTTP session modes:
+  The default stateful mode follows the standard MCP session flow:
+  initialize -> Mcp-Session-Id -> subsequent requests. Use it for Inspector,
+  Claude, and other session-aware clients.
+
+  --stateless disables HTTP sessions. Use it for a client that makes an MCP
+  discovery/preflight request before initialize (for example, ChatGPT's
+  openai-mcp client). In this mode every request is independent, and the
+  server does not send an Mcp-Session-Id header.
+
+Examples:
+  # Default stateful HTTP server for Inspector or Claude
+  grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless
+
+  # ChatGPT-compatible stateless HTTP server, suitable for a reverse tunnel
+  grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless --stateless
+
+  # Local stdio transport
+  grok mcp server --transport stdio --headless";
+
 #[derive(Debug, clap::Args, Clone)]
 pub struct McpArgs {
     #[command(subcommand)]
@@ -109,6 +130,7 @@ pub enum McpCommand {
 /// Arguments for `grok mcp server`. The outer pager binary has already applied
 /// the selected workspace sandbox before dispatching this command.
 #[derive(Debug, clap::Args, Clone)]
+#[command(after_help = GATEWAY_SERVER_AFTER_HELP)]
 pub struct GatewayServerArgs {
     /// Workspace root. Defaults to the current directory.
     #[arg(long, value_name = "DIR")]
@@ -125,6 +147,12 @@ pub struct GatewayServerArgs {
     /// HTTP port.
     #[arg(long, default_value_t = 8765)]
     pub port: u16,
+    /// Disable MCP HTTP sessions for clients that probe before `initialize`.
+    ///
+    /// Use this for ChatGPT's `openai-mcp` client. The default stateful mode
+    /// is appropriate for clients which preserve `Mcp-Session-Id`.
+    #[arg(long)]
+    pub stateless: bool,
     /// Run without the Grok Build activity and approval UI. Required for
     /// stdio, whose terminal streams belong to the MCP client.
     #[arg(long)]
@@ -206,6 +234,9 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
     if args.terminal_approval && args.transport != GatewayTransport::Http {
         bail!("--terminal-approval is only supported with --transport http");
     }
+    if args.stateless && args.transport != GatewayTransport::Http {
+        bail!("--stateless is only supported with --transport http");
+    }
     let workspace = dunce::canonicalize(args.workspace.unwrap_or(std::env::current_dir()?))?;
     let session = match args.mcp_config {
         Some(path) => {
@@ -223,9 +254,12 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
         let session = Arc::clone(server.session());
         let bridge =
             xai_grok_mcp_server::LocalObserverBridge::spawn(session.event_bus(), approvals);
-        let http =
-            xai_grok_mcp_server::HttpGateway::bind(server, SocketAddr::new(args.host, args.port))
-                .await?;
+        let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful(
+            server,
+            SocketAddr::new(args.host, args.port),
+            !args.stateless,
+        )
+        .await?;
         let status = crate::gateway_observer::GatewayObserverStatus {
             workspace: workspace.display().to_string(),
             endpoint: http.endpoint(),
@@ -260,9 +294,10 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
                 .await?;
         }
         GatewayTransport::Http => {
-            let http = xai_grok_mcp_server::HttpGateway::bind(
+            let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful(
                 server,
                 SocketAddr::new(args.host, args.port),
+                !args.stateless,
             )
             .await?;
             eprintln!(

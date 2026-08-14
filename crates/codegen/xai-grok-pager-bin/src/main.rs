@@ -103,14 +103,17 @@ fn print_serve_startup_info(bind_addr: SocketAddr, secret: &str) {
 }
 /// Entrypoint tag for `grok -p`; keys the quiet stderr default in `init_tracing_simple`.
 const HEADLESS_ENTRYPOINT: &str = "headless";
+/// Entrypoint tag for a headless HTTP MCP gateway. Unlike `grok -p`, the
+/// gateway must make inbound-client failures observable in its terminal.
+const MCP_GATEWAY_HEADLESS_ENTRYPOINT: &str = "mcp-gateway-headless";
 /// Initialize simple tracing for non-TUI agent modes.
 fn init_tracing_simple(app_entrypoint: &'static str) {
     use tracing_subscriber::{EnvFilter, Layer as _, fmt, layer::SubscriberExt as _};
     use xai_grok_telemetry::debug_log::RMCP_SSE_NOISE_TARGET;
-    let default_filter = if app_entrypoint == HEADLESS_ENTRYPOINT {
-        "off"
-    } else {
-        "error"
+    let default_filter = match app_entrypoint {
+        HEADLESS_ENTRYPOINT => "off",
+        MCP_GATEWAY_HEADLESS_ENTRYPOINT => "xai_grok_mcp_server=info",
+        _ => "error",
     };
     let env_filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter.add_directive(
@@ -2041,7 +2044,13 @@ async fn async_main(args: PagerArgs) -> Result<()> {
                 return Ok(());
             }
             Command::Mcp(mcp_args) => {
-                init_tracing_simple("cli");
+                let entrypoint = match &mcp_args.command {
+                    xai_grok_pager::mcp_cmd::McpCommand::Server(args) if args.headless => {
+                        MCP_GATEWAY_HEADLESS_ENTRYPOINT
+                    }
+                    _ => "cli",
+                };
+                init_tracing_simple(entrypoint);
                 return xai_grok_pager::mcp_cmd::run(mcp_args).await;
             }
             Command::Plugin(plugin_args) => {
