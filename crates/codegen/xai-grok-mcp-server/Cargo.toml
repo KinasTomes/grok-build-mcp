@@ -3,7 +3,7 @@ name = "xai-grok-mcp-server"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Standalone MCP gateway for the Grok Build local tool runtime"
+description = "MCP gateway runtime for the Grok Build local tool frontend"
 
 [dependencies]
 anyhow = { workspace = true }
