@@ -237,6 +237,9 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
     if args.stateless && args.transport != GatewayTransport::Http {
         bail!("--stateless is only supported with --transport http");
     }
+    let api_key = (args.transport == GatewayTransport::Http)
+        .then(xai_grok_mcp_server::gateway_api_key_from_env)
+        .transpose()?;
     let workspace = dunce::canonicalize(args.workspace.unwrap_or(std::env::current_dir()?))?;
     let session = match args.mcp_config {
         Some(path) => {
@@ -254,10 +257,11 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
         let session = Arc::clone(server.session());
         let bridge =
             xai_grok_mcp_server::LocalObserverBridge::spawn(session.event_bus(), approvals);
-        let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful(
+        let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful_and_api_key(
             server,
             SocketAddr::new(args.host, args.port),
             !args.stateless,
+            api_key,
         )
         .await?;
         let status = crate::gateway_observer::GatewayObserverStatus {
@@ -294,10 +298,11 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
                 .await?;
         }
         GatewayTransport::Http => {
-            let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful(
+            let http = xai_grok_mcp_server::HttpGateway::bind_with_stateful_and_api_key(
                 server,
                 SocketAddr::new(args.host, args.port),
                 !args.stateless,
+                api_key,
             )
             .await?;
             eprintln!(

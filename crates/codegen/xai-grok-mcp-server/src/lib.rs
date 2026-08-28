@@ -13,7 +13,9 @@ mod transport;
 pub use events::ObserverToolDetails;
 pub use policy::{GatewayPermission, GatewayPermissionDecision, ShellPolicy};
 pub use server::GatewayServer;
-pub use transport::{HttpGateway, MCP_HTTP_ENDPOINT};
+pub use transport::{
+    GATEWAY_API_KEY_ENV, HttpGateway, MCP_HTTP_ENDPOINT, gateway_api_key_from_env,
+};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
