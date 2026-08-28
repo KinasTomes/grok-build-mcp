@@ -3,11 +3,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
-use axum::{extract::Request, middleware::Next, response::Response};
+use axum::{
+    extract::{Request, State},
+    http::{StatusCode, header::AUTHORIZATION},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use rmcp::transport::{
     StreamableHttpServerConfig, StreamableHttpService,
     streamable_http_server::session::local::LocalSessionManager,
 };
+use subtle::ConstantTimeEq;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -15,6 +21,18 @@ use crate::{GatewayServer, GatewaySession};
 
 /// Stable Streamable HTTP endpoint path.
 pub const MCP_HTTP_ENDPOINT: &str = "/mcp";
+
+/// Required bearer token environment variable for the public HTTP gateway.
+pub const GATEWAY_API_KEY_ENV: &str = "GROK_MCP_API_KEY";
+
+/// Loads the static bearer token for a public HTTP gateway.
+pub fn gateway_api_key_from_env() -> anyhow::Result<String> {
+    let key = std::env::var(GATEWAY_API_KEY_ENV)
+        .ok()
+        .filter(|key| key.len() >= 32)
+        .with_context(|| format!("{GATEWAY_API_KEY_ENV} must contain at least 32 characters"))?;
+    Ok(key)
+}
 
 /// A bound Streamable HTTP gateway and its coordinated shutdown handle.
 pub struct HttpGateway {
@@ -38,6 +56,16 @@ impl HttpGateway {
         server: GatewayServer,
         address: SocketAddr,
         stateful: bool,
+    ) -> anyhow::Result<Self> {
+        Self::bind_with_stateful_and_api_key(server, address, stateful, None).await
+    }
+
+    /// Bind the shared gateway session with an optional static bearer token.
+    pub async fn bind_with_stateful_and_api_key(
+        server: GatewayServer,
+        address: SocketAddr,
+        stateful: bool,
+        api_key: Option<String>,
     ) -> anyhow::Result<Self> {
         let listener = tokio::net::TcpListener::bind(address)
             .await
@@ -65,11 +93,17 @@ impl HttpGateway {
             Arc::new(LocalSessionManager::default()),
             config,
         );
-        let app = axum::Router::new()
-            .nest_service(MCP_HTTP_ENDPOINT, service)
-            // Keep this deliberately header-only: MCP requests often contain
-            // source code and tool arguments, which must not enter logs.
-            .layer(axum::middleware::from_fn(log_mcp_http_request));
+        let app = axum::Router::new().nest_service(MCP_HTTP_ENDPOINT, service);
+        let app = match api_key {
+            Some(api_key) => app.route_layer(axum::middleware::from_fn_with_state(
+                api_key,
+                require_api_key,
+            )),
+            None => app,
+        }
+        // Keep this deliberately header-only: MCP requests often contain
+        // source code and tool arguments, which must not enter logs.
+        .layer(axum::middleware::from_fn(log_mcp_http_request));
         let server_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -100,6 +134,23 @@ impl HttpGateway {
         self.session.shutdown().await;
         Ok(())
     }
+}
+
+async fn require_api_key(State(expected): State<String>, request: Request, next: Next) -> Response {
+    let provided = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("Bearer").then_some(token));
+    match provided.filter(|token| api_key_matches(token, &expected)) {
+        Some(_) => next.run(request).await,
+        None => (StatusCode::UNAUTHORIZED, [("www-authenticate", "Bearer")]).into_response(),
+    }
+}
+
+fn api_key_matches(provided: &str, expected: &str) -> bool {
+    provided.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 /// Emit request metadata needed to diagnose remote MCP client compatibility.
@@ -153,4 +204,21 @@ fn allowed_hosts(address: SocketAddr) -> Vec<String> {
         ]);
     }
     hosts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_match_requires_the_exact_value() {
+        assert!(api_key_matches(
+            "x".repeat(32).as_str(),
+            "x".repeat(32).as_str()
+        ));
+        assert!(!api_key_matches(
+            "x".repeat(32).as_str(),
+            "y".repeat(32).as_str()
+        ));
+    }
 }

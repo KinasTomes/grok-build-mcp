@@ -13542,6 +13542,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "tokio",
  "tokio-util",

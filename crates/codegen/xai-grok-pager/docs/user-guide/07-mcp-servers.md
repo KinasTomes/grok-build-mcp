@@ -79,6 +79,22 @@ url = "https://mcp.example.com/api/mcp"
 headers = { "x-mcp-session-id" = "{{session_id}}" }
 ```
 
+### Hosting the Built-in HTTP Gateway
+
+The public gateway requires a static bearer token. Set a random value of at
+least 32 characters before starting it:
+
+```bash
+export GROK_MCP_API_KEY="replace-with-a-random-secret"
+grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless --stateless
+```
+
+Clients must send it on every MCP request:
+
+```toml
+headers = { "Authorization" = "Bearer ${GROK_MCP_API_KEY}" }
+```
+
 ---
 
 ## CLI Management
