@@ -819,6 +819,51 @@ async fn shell_permission_keeps_safe_ask_and_deny_distinct() {
 }
 
 #[tokio::test]
+async fn always_approve_runs_ask_but_preserves_hard_denials() {
+    let workspace = TempDir::new().unwrap();
+    let session = GatewaySession::new(workspace.path())
+        .unwrap()
+        .with_always_approve();
+    let client = start_gateway_session(session).await;
+
+    let promptable = client
+        .call_tool(
+            CallToolRequestParams::new("run_terminal_cmd").with_arguments(
+                serde_json::json!({"command":"echo approved","description":"test auto approval","is_background":false})
+                    .as_object().unwrap().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(promptable.is_error, Some(false));
+
+    let destructive = client
+        .call_tool(
+            CallToolRequestParams::new("run_terminal_cmd").with_arguments(
+                serde_json::json!({"command":"rm -rf /","description":"must stay denied","is_background":false})
+                    .as_object().unwrap().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(destructive.is_error, Some(true));
+
+    let outside = client
+        .call_tool(
+            CallToolRequestParams::new(READ_FILE_TOOL).with_arguments(
+                serde_json::json!({"target_file":"../outside.txt"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outside.is_error, Some(true));
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn execution_failure_emits_failed_lifecycle_event() {
     let workspace = TempDir::new().unwrap();
     let (session, client) =
