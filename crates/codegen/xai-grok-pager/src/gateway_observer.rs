@@ -329,7 +329,9 @@ fn observer_tool_block(
                 old_text, new_text, ..
             }),
             ToolCallBlock::Edit(edit),
-        ) => edit.set_hunks(xai_grok_pager_diff::diff_hunks_from_strings(old_text, new_text, 1)),
+        ) => edit.set_hunks(xai_grok_pager_diff::diff_hunks_from_strings(
+            old_text, new_text, 1,
+        )),
         (Some(ObserverToolDetails::Write { content, .. }), ToolCallBlock::Edit(edit)) => {
             edit.set_hunks(xai_grok_pager_diff::diff_hunks_from_strings("", content, 1));
             edit.prefix = "Creating ";
