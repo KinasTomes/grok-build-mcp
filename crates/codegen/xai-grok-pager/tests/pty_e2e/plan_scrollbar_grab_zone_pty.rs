@@ -4,15 +4,12 @@ use super::common::*;
 const TAG: &str = "SBGRAB";
 const PLAN_LINES: usize = 120;
 
-/// PTY: presses, wheels, and drags on the modal border column next to the
-/// scrollbar track must scroll the plan. Users read the thumb + border as
-/// one two-column scrollbar and press the border half (reported on macOS
-/// Terminal.app and ghostty over SSH), which used to fall into the
-/// click-outside-modal path.
+/// PTY: presses, wheels, and drags on the modal border column next to the scrollbar track must scroll the plan.
+/// Users read the thumb and border as one two-column scrollbar and press the border half (reported on macOS Terminal.app and ghostty over SSH).
+/// That press used to fall into the click-outside-modal path.
 ///
-/// Also pins the thumb contract `bg == fg`: Terminal.app leaves line-gap
-/// pixels unpainted under a foreground-only `█`, striping the thumb with
-/// dark bars.
+/// Also pins the thumb contract `bg == fg`.
+/// Terminal.app leaves line-gap pixels unpainted under a foreground-only `█`, striping the thumb with dark bars.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "PTY e2e; run the owning pty_e2e_* Cargo test with --ignored (see Cargo.toml)"]
 async fn plan_scrollbar_grab_zone_pty() {
@@ -38,6 +35,11 @@ async fn plan_scrollbar_grab_zone_pty() {
     harness
         .wait_for_text(MOCK_RESPONSE_SENTINEL, Duration::from_secs(40))
         .expect("first turn streams");
+    // Submitting `exit_plan_mode` before the first turn is idle can consume the scripted tool call while the session is still finalizing
+    // Plan Exit then hangs without parking approval chrome
+    harness
+        .wait_for_turn_idle(Duration::from_secs(20))
+        .expect("first turn idle");
 
     let dir = session_dir(&content, &mut harness);
     std::fs::write(dir.join("plan.md"), plan_body(TAG, PLAN_LINES)).expect("seed plan.md");
@@ -47,10 +49,23 @@ async fn plan_scrollbar_grab_zone_pty() {
         .inject_keys(b"present the plan\r")
         .expect("submit plan prompt");
     harness
-        .wait_for_text("request changes", Duration::from_secs(60))
+        .wait_for_text("Waiting on plan approval", Duration::from_secs(60))
         .unwrap_or_else(|e| {
             panic!(
                 "plan approval never parked: {e}\nscreen:\n{}",
+                harness.screen_contents()
+            )
+        });
+    harness
+        .wait_until_stable(
+            "plan approval preview interactive",
+            Duration::from_secs(20),
+            Duration::from_millis(250),
+            |h| h.contains_text("request changes") && h.contains_text("Waiting on plan approval"),
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "plan approval preview never settled: {e}\nscreen:\n{}",
                 harness.screen_contents()
             )
         });
@@ -109,8 +124,7 @@ async fn plan_scrollbar_grab_zone_pty() {
             )
         });
 
-    // A single synthetic notch was observed to be swallowed by the
-    // scroll-stream cadence; real wheels emit bursts.
+    // A single synthetic wheel notch was observed to get swallowed by the scroll handling; real wheels emit bursts
     let wheel_up: String = (0..6)
         .map(|_| sgr_mouse(64, track_bottom_row, border_col, 'M'))
         .collect();

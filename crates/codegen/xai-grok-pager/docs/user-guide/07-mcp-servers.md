@@ -71,6 +71,17 @@ url = "https://mcp.example.com/api"
 headers = { "Authorization" = "Bearer token" }
 ```
 
+MCP data-plane requests (JSON-RPC and SSE) and the anonymous-access probe carry a
+default `User-Agent: grok-cli/<version>` header, where `<version>` is the Grok binary
+version. OAuth discovery, client registration, and token requests are issued by the
+rmcp OAuth client and keep its own behavior (no default `User-Agent`). A valid
+`User-Agent` entry in the server's `headers` overrides the default; an invalid
+configured `User-Agent` value is dropped by header parsing (with a warning), so such a
+server still receives the default. Exception: Figma MCP servers (server name `figma`,
+legacy managed name `grok_com_figma`, or a `figma.com` host — all case-insensitive)
+send the bare token `grok-cli` with no version unless the config supplies its own
+`User-Agent`.
+
 ### Streamable HTTP with Session ID
 
 ```toml
@@ -88,6 +99,11 @@ least 32 characters before starting it:
 export GROK_MCP_API_KEY="replace-with-a-random-secret"
 grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless --stateless
 ```
+
+For unattended execution, add `--always-approve` (aliases: `--yolo` and
+`--dangerously-skip-permissions`). It auto-approves calls that would normally
+prompt, but hard denials such as destructive commands and paths outside the
+workspace still apply.
 
 Clients must send it on every MCP request:
 

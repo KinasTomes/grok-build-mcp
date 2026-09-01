@@ -28,6 +28,15 @@ use xai_tool_types::SubagentCompletedOutput;
 use xai_tool_types::TaskOutputOutput;
 /// Default tool name used in auto-wake completion messages.
 pub const DEFAULT_TASK_OUTPUT_TOOL: &str = "get_task_output";
+/// UI/Stop kill with no live waiter: tell the model not to relaunch the task.
+const USER_KILLED_NOTICE: &str = "This task was killed by the user — do not restart it.\n";
+fn user_killed_notice(task: &TaskSnapshot) -> &'static str {
+    if task.explicitly_killed && !task.kill_result_delivered {
+        USER_KILLED_NOTICE
+    } else {
+        ""
+    }
+}
 /// Inline preview cap applied ONLY to bash completion reminders that ship
 /// with a disk-pointer footer. Subagent completions (which have no
 /// disk-backed output file) are never truncated -- the inline branch is
@@ -127,9 +136,11 @@ pub fn format_bash_completion(
             format!("exit code: {exit_code_str}")
         }
     };
+    let notice = user_killed_notice(task);
     let mut msg = format!(
         "Background task \"{}\" completed ({}).\n\
-         Command: {} | Duration: {:.1}s\n",
+         Command: {} | Duration: {:.1}s\n\
+         {notice}",
         task.task_id, status_str, command, duration_secs,
     );
     if task.signal.is_some() && duration_secs < 1.0 {
@@ -178,12 +189,14 @@ pub fn format_monitor_completion(task: &TaskSnapshot, task_output_name: Option<&
         .and_then(|d| d.strip_prefix("[monitor] "))
         .unwrap_or("monitor");
     let tool = task_output_name.unwrap_or(DEFAULT_TASK_OUTPUT_TOOL);
+    let notice = user_killed_notice(task);
     format!(
         "Monitor \"{id}\" ended: [monitor ended: {reason}].\n\
          Description: {description}\n\
          Command: {cmd}\n\
          Duration: {dur:.1}s\n\
-         Use {tool}(\"{id}\") for full output.",
+         Use {tool}(\"{id}\") for full output.\n\
+         {notice}",
         id = task.task_id,
         cmd = task.command,
         dur = task.duration_secs(),
@@ -395,6 +408,26 @@ pub async fn resolve_task_output_tool_name(bridge: &ToolBridge) -> Option<String
 pub async fn resolve_read_tool_name(bridge: &ToolBridge) -> Option<String> {
     bridge.tool_for_kind(ToolKind::Read).await
 }
+/// Resolve the active toolset's scheduled-task deletion tool name.
+pub async fn resolve_scheduler_delete_tool_name(bridge: &ToolBridge) -> Option<String> {
+    bridge.tool_for_registry_id("scheduler_delete")
+}
+fn append_loop_remediation_hint(
+    out: &mut String,
+    completion: &SubagentCompletionSummary,
+    prefix: &str,
+) {
+    if completion
+        .loop_task_id
+        .as_deref()
+        .is_some_and(|task_id| !task_id.is_empty())
+    {
+        out.push_str(prefix);
+        out.push_str(
+            "Read through the subagent output. Fix reported issues with monitored jobs, and kill or restart jobs with fatal errors.",
+        );
+    }
+}
 /// Format a model-facing message from a [`SubagentCompletionSummary`] for
 /// the next-tool-call reminder surface.
 ///
@@ -409,6 +442,7 @@ pub async fn resolve_read_tool_name(bridge: &ToolBridge) -> Option<String> {
 pub fn format_subagent_completion(
     c: &SubagentCompletionSummary,
     task_output_name: Option<&str>,
+    scheduler_delete_name: Option<&str>,
 ) -> String {
     let status = if c.success {
         "successfully"
@@ -437,7 +471,32 @@ pub fn format_subagent_completion(
         task_output_name,
         None,
     );
+    append_scheduler_cleanup_hint(&mut out, c, scheduler_delete_name, "\n");
+    append_loop_remediation_hint(&mut out, c, "\n\n");
     out
+}
+fn append_scheduler_cleanup_hint(
+    out: &mut String,
+    completion: &SubagentCompletionSummary,
+    scheduler_delete_name: Option<&str>,
+    prefix: &str,
+) {
+    let Some(task_id) = completion
+        .loop_task_id
+        .as_deref()
+        .filter(|task_id| !task_id.is_empty())
+    else {
+        return;
+    };
+    let Some(delete_name) = scheduler_delete_name else {
+        return;
+    };
+    out.push_str(prefix);
+    out.push_str(
+        &format!(
+        "If the monitored work is complete, call `{delete_name}(\"{task_id}\")` to stop the monitor."
+    ),
+    );
 }
 /// Format buffered between-turn subagent completions into a system-reminder
 /// string. When `task_output_name` is `None` each subagent's full output is
@@ -445,6 +504,7 @@ pub fn format_subagent_completion(
 pub fn format_between_turn_completions(
     completions: &[SubagentCompletionSummary],
     task_output_name: Option<&str>,
+    scheduler_delete_name: Option<&str>,
 ) -> String {
     use std::fmt::Write as _;
     let n = completions.len();
@@ -473,6 +533,8 @@ pub fn format_between_turn_completions(
             task_output_name,
             None,
         );
+        append_scheduler_cleanup_hint(&mut buf, c, scheduler_delete_name, "\n  ");
+        append_loop_remediation_hint(&mut buf, c, "\n\n");
         buf.push('\n');
     }
     buf
@@ -488,7 +550,12 @@ pub async fn format_between_turn_completion_reminder(
     bridge: &ToolBridge,
 ) -> String {
     let task_output_name = resolve_task_output_tool_name(bridge).await;
-    format_between_turn_completions(completions, task_output_name.as_deref())
+    let scheduler_delete_name = resolve_scheduler_delete_tool_name(bridge).await;
+    format_between_turn_completions(
+        completions,
+        task_output_name.as_deref(),
+        scheduler_delete_name.as_deref(),
+    )
 }
 /// Format between-turn bash task completions into a system-reminder string.
 pub fn format_between_turn_bash_completions(
@@ -602,6 +669,7 @@ pub fn consumed_completion_ids(output: &ToolOutput) -> Vec<&str> {
         | ToolOutput::EnterPlanMode(_)
         | ToolOutput::ExitPlanMode(_)
         | ToolOutput::AskUserQuestion(_)
+        | ToolOutput::SendSubagentMessage(_)
         | ToolOutput::Monitor(_)
         | ToolOutput::SchedulerCreate(_)
         | ToolOutput::SchedulerDelete(_)
@@ -755,16 +823,22 @@ impl Reminder for TaskCompletionReminder {
                 let goal_loop_active = res
                     .get::<crate::implementations::grok_build::task::types::GoalLoopActive>()
                     .is_some_and(|g| g.0);
-                let task_output_name: Option<String> = res
-                    .get::<crate::types::template_renderer::TemplateRenderer>()
-                    .and_then(|r| {
-                        r.tool_for_kind(crate::types::tool::ToolKind::BackgroundTaskAction)
-                            .map(str::to_string)
-                    });
+                let renderer = res.get::<crate::types::template_renderer::TemplateRenderer>();
+                let task_output_name: Option<String> = renderer.and_then(|r| {
+                    r.tool_for_kind(crate::types::tool::ToolKind::BackgroundTaskAction)
+                        .map(str::to_string)
+                });
+                let scheduler_delete_name: Option<String> = res
+                    .get::<crate::types::resources::NativeToolClientNames>()
+                    .and_then(|names| names.0.get("scheduler_delete").cloned());
                 let state = res.get_or_default::<State<ReportedTaskCompletions>>();
                 for c in &completions {
                     if state.reported.insert(c.subagent_id.clone()) && !goal_loop_active {
-                        reminders.push(format_subagent_completion(c, task_output_name.as_deref()));
+                        reminders.push(format_subagent_completion(
+                            c,
+                            task_output_name.as_deref(),
+                            scheduler_delete_name.as_deref(),
+                        ));
                     }
                 }
             }
@@ -811,6 +885,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -821,6 +896,46 @@ mod tests {
         assert!(msg.contains("exit code: 0"));
         assert!(msg.contains("cargo test"));
         assert!(msg.contains("get_command_or_subagent_output(\"abc-123\")"));
+        assert!(
+            !msg.contains("killed by the user"),
+            "natural completion must not carry the UI-kill notice: {msg}"
+        );
+    }
+    #[test]
+    fn format_bash_completion_ui_kill_says_do_not_restart() {
+        let mut task = TaskSnapshot {
+            task_id: "ui-kill".into(),
+            command: "sleep 60".into(),
+            display_command: None,
+            cwd: String::new(),
+            start_time: std::time::SystemTime::now(),
+            end_time: Some(std::time::SystemTime::now()),
+            output: String::new(),
+            output_file: std::path::PathBuf::new(),
+            truncated: false,
+            exit_code: None,
+            signal: Some("SIGKILL".into()),
+            completed: true,
+            kind: Default::default(),
+            block_waited: false,
+            explicitly_killed: true,
+            kill_result_delivered: false,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: true,
+            output_total_bytes: 0,
+        };
+        let msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
+        assert!(
+            msg.contains("killed by the user — do not restart it"),
+            "UI-kill wake must include the do-not-restart line: {msg}"
+        );
+        task.kill_result_delivered = true;
+        let model_msg = format_bash_completion(&task, Some("get_command_or_subagent_output"), None);
+        assert!(
+            !model_msg.contains("killed by the user"),
+            "model-tool kill must not tell the model the user killed it: {model_msg}"
+        );
     }
     #[test]
     fn format_monitor_completion_exit_zero() {
@@ -840,6 +955,7 @@ mod tests {
             kind: crate::computer::types::TaskKind::Monitor,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -875,6 +991,7 @@ mod tests {
             kind: crate::computer::types::TaskKind::Monitor,
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -886,6 +1003,42 @@ mod tests {
             "expected signal wording: {msg}"
         );
         assert!(msg.contains("get_task_output(\"mon-sig\")"), "{msg}");
+    }
+    #[test]
+    fn format_monitor_completion_ui_kill_says_do_not_restart() {
+        let mut task = TaskSnapshot {
+            task_id: "mon-ui".into(),
+            command: "tail -f app.log".into(),
+            display_command: Some("[monitor] app".into()),
+            cwd: String::new(),
+            start_time: std::time::SystemTime::now(),
+            end_time: Some(std::time::SystemTime::now()),
+            output: String::new(),
+            output_file: std::path::PathBuf::new(),
+            truncated: false,
+            exit_code: None,
+            signal: Some("SIGKILL".into()),
+            completed: true,
+            kind: crate::computer::types::TaskKind::Monitor,
+            block_waited: false,
+            explicitly_killed: true,
+            kill_result_delivered: false,
+            owner_session_id: None,
+            description: None,
+            is_backgrounded: true,
+            output_total_bytes: 0,
+        };
+        let msg = format_monitor_completion(&task, None);
+        assert!(
+            msg.contains("\nThis task was killed by the user — do not restart it.\n"),
+            "UI-killed monitor notice must be on its own line: {msg}"
+        );
+        task.kill_result_delivered = true;
+        let model_msg = format_monitor_completion(&task, None);
+        assert!(
+            !model_msg.contains("killed by the user"),
+            "model-tool monitor kill must not carry the UI-kill notice: {model_msg}"
+        );
     }
     #[test]
     fn format_bash_completion_prefers_display_command() {
@@ -905,6 +1058,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -932,6 +1086,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -962,6 +1117,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -1003,6 +1159,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -1043,6 +1200,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -1206,6 +1364,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -1254,6 +1413,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: None,
             description: None,
             is_backgrounded: false,
@@ -1505,6 +1665,7 @@ mod tests {
             subagent_id: id.into(),
             subagent_type: "general-purpose".into(),
             description: "test task".into(),
+            loop_task_id: None,
             success,
             duration_ms: 5000,
             tool_calls: 3,
@@ -1698,7 +1859,7 @@ mod tests {
     #[test]
     fn format_subagent_completion_success_with_poll_tool() {
         let c = make_subagent_completion("sub-abc", true);
-        let msg = format_subagent_completion(&c, Some("get_task_output"));
+        let msg = format_subagent_completion(&c, Some("get_task_output"), None);
         assert!(msg.contains("sub-abc"));
         assert!(msg.contains("successfully"));
         assert!(msg.contains("general-purpose"));
@@ -1709,15 +1870,42 @@ mod tests {
         assert!(msg.contains(r#"get_task_output("sub-abc")"#));
     }
     #[test]
+    fn format_scheduler_loop_completion_includes_cleanup_instruction() {
+        let mut c = make_subagent_completion("sub-loop", true);
+        c.loop_task_id = Some("loop-123".into());
+        let msg = format_subagent_completion(
+            &c,
+            Some("get_task_output"),
+            Some("renamed_scheduler_delete"),
+        );
+        assert_eq!(
+            msg,
+            "Background subagent \"sub-loop\" (general-purpose: \"test task\") completed successfully.\n\
+             Duration: 5.0s | Tool calls: 3 | Turns: 2\n\
+             Use get_task_output(\"sub-loop\") to see the full output.\n\
+             If the monitored work is complete, call `renamed_scheduler_delete(\"loop-123\")` to stop the monitor.\n\n\
+             Read through the subagent output. Fix reported issues with monitored jobs, and kill or restart jobs with fatal errors."
+        );
+    }
+    #[test]
+    fn cleanup_instruction_requires_nonempty_id_and_delete_tool() {
+        for loop_task_id in [None, Some(String::new()), Some("loop-123".into())] {
+            let mut c = make_subagent_completion("sub-loop", true);
+            c.loop_task_id = loop_task_id;
+            let msg = format_subagent_completion(&c, Some("get_task_output"), None);
+            assert!(!msg.contains("to stop the monitor"));
+        }
+    }
+    #[test]
     fn format_subagent_completion_failure() {
         let c = make_subagent_completion("sub-fail", false);
-        let msg = format_subagent_completion(&c, Some("get_task_output"));
+        let msg = format_subagent_completion(&c, Some("get_task_output"), None);
         assert!(msg.contains("with failure"));
     }
     #[test]
     fn format_subagent_completion_inlines_output_when_no_poll_tool() {
         let c = make_subagent_completion("sub-abc", true);
-        let msg = format_subagent_completion(&c, None);
+        let msg = format_subagent_completion(&c, None, None);
         assert!(msg.contains("sub-abc"));
         assert!(msg.contains("successfully"));
         assert!(
@@ -1838,7 +2026,7 @@ mod tests {
         let mut c = make_subagent_completion("sub-large", true);
         let large_output = "y".repeat(MAX_INLINE_COMPLETION_BYTES * 5);
         c.output = std::sync::Arc::from(large_output.as_str());
-        let msg = format_subagent_completion(&c, None);
+        let msg = format_subagent_completion(&c, None, None);
         assert!(
             msg.contains(&large_output),
             "subagent inline output must be preserved verbatim, got len={}",
@@ -1855,7 +2043,7 @@ mod tests {
         let mut c = make_subagent_completion("sub-batch", true);
         let large_output = "z".repeat(MAX_INLINE_COMPLETION_BYTES * 3);
         c.output = std::sync::Arc::from(large_output.as_str());
-        let msg = format_between_turn_completions(&[c], None);
+        let msg = format_between_turn_completions(&[c], None, None);
         assert!(
             msg.contains(&large_output),
             "between-turn subagent inline output must be preserved verbatim"

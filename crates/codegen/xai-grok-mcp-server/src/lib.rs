@@ -196,8 +196,8 @@ impl GatewaySession {
             .lock()
             .await
             .set_client_event_tx(Some(event_tx.clone()));
-        let event_writer = xai_file_utils::events::EventWriter::noop();
-        let ctx = xai_grok_mcp::servers::McpSpawnCtx::session_less(&event_writer);
+        let event_writer = xai_grok_session_events::EventWriter::noop();
+        let ctx = xai_grok_mcp::servers::McpSpawnCtx::standalone(&event_writer);
         let started = xai_grok_mcp::servers::start_mcp_servers(
             native.servers,
             &Default::default(),
@@ -233,6 +233,12 @@ impl GatewaySession {
 
     pub fn permission(&self) -> &GatewayPermission {
         &self.permission
+    }
+
+    /// Auto-approve promptable calls while retaining hard policy denials.
+    pub fn with_always_approve(mut self) -> Self {
+        self.permission = self.permission.with_always_approve();
+        self
     }
 
     pub fn event_bus(&self) -> &GatewayEventBus {

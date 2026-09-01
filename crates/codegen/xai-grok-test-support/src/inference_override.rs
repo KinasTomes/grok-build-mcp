@@ -133,7 +133,7 @@ impl ExpectationControl {
     }
 }
 
-/// Deterministic lifecycle handle for one registered inference expectation.
+/// Handle for one registered inference expectation: lets a test wait on its phases and release its terminal barrier.
 #[must_use = "expectation handles provide synchronization and satisfaction checks"]
 pub struct InferenceExpectation {
     control: Arc<ExpectationControl>,
@@ -159,7 +159,7 @@ impl InferenceExpectation {
         self.wait_for(ExpectationPhase::Blocked).await;
     }
 
-    /// Wait until the primary response pipeline crosses its terminal boundary.
+    /// Wait until the primary response crosses its terminal event.
     pub async fn wait_satisfied(&mut self) {
         self.wait_for(ExpectationPhase::Satisfied).await;
     }
@@ -174,7 +174,7 @@ impl InferenceExpectation {
         self.control.release();
     }
 
-    /// Panic with the expectation name and lifecycle state unless satisfied.
+    /// Panic with the expectation name and phase unless satisfied.
     pub fn assert_satisfied(&self) {
         assert!(
             self.is_satisfied(),
@@ -259,12 +259,21 @@ struct ExpectationState {
 type Expectations = Arc<std::sync::Mutex<ExpectationState>>;
 type ScriptQueues = Arc<std::sync::Mutex<HashMap<String, VecDeque<ScriptedResponse>>>>;
 
+/// Default-responder concurrency cap: over `cap` in-flight (each held for `hold`), extra requests get a 429 with `Retry-After`.
+#[derive(Clone)]
+struct ConcurrencyCap {
+    slots: Arc<tokio::sync::Semaphore>,
+    hold: Duration,
+    retry_after_secs: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct InferenceOverrides {
     expectations: Expectations,
     scripted: ScriptQueues,
     completion_gate: Arc<CompletionGate>,
     required_token: Option<Arc<str>>,
+    concurrency_cap: Arc<std::sync::Mutex<Option<ConcurrencyCap>>>,
 }
 
 impl InferenceOverrides {
@@ -274,7 +283,16 @@ impl InferenceOverrides {
             scripted: Arc::new(std::sync::Mutex::new(HashMap::new())),
             completion_gate: Arc::new(CompletionGate::default()),
             required_token: required_token.map(Arc::from),
+            concurrency_cap: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn set_concurrency_cap(&self, cap: usize, hold: Duration, retry_after_secs: u64) {
+        *self.concurrency_cap.lock().unwrap() = Some(ConcurrencyCap {
+            slots: Arc::new(tokio::sync::Semaphore::new(cap)),
+            hold,
+            retry_after_secs,
+        });
     }
 
     pub(crate) fn classify(
@@ -315,7 +333,28 @@ impl InferenceOverrides {
             return Some(response.into_response_paced(delay, wait).await);
         }
 
-        self.auth_rejection(headers)
+        if let Some(rejection) = self.auth_rejection(headers) {
+            return Some(rejection);
+        }
+
+        // Cap only the default-responder fallthrough; scripts/expectations stay deterministic.
+        let cap = self.concurrency_cap.lock().unwrap().clone();
+        if let Some(cap) = cap {
+            match Arc::clone(&cap.slots).try_acquire_owned() {
+                Ok(permit) => {
+                    tokio::time::sleep(cap.hold).await;
+                    drop(permit);
+                }
+                Err(_) => {
+                    let mut reply = ScriptedResponse::text(429, "concurrent request cap exceeded");
+                    reply
+                        .headers
+                        .push(("retry-after".to_string(), cap.retry_after_secs.to_string()));
+                    return Some(reply.into_response_paced(delay, None).await);
+                }
+            }
+        }
+        None
     }
 
     pub(crate) fn register_expectation(

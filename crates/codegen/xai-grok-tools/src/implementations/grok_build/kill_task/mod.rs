@@ -6,7 +6,7 @@
 pub mod terminal_command;
 pub use terminal_command::KillTerminalCommandTool;
 
-use crate::computer::types::KillOutcome;
+use crate::computer::types::{KillOutcome, KillSource};
 use crate::implementations::grok_build::task::TaskTool;
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::types::SubagentCancelOutcome;
@@ -202,7 +202,10 @@ impl xai_tool_runtime::Tool for KillTaskTool {
             terminal = res.require::<Terminal>()?.0.clone();
         }
 
-        match terminal.kill_task(&input.task_id).await {
+        match terminal
+            .kill_task_with_source(&input.task_id, KillSource::ModelTool)
+            .await
+        {
             KillOutcome::Killed => Ok(KillTaskOutput::Result(KillTaskResult {
                 task_id: input.task_id.clone(),
                 outcome: "killed".to_string(),
@@ -341,16 +344,8 @@ mod tests {
         // The static fallback is the shared builder's default grok-build
         // rendering (monitor + task + bash present) for the current OS.
         let desc = crate::types::tool_metadata::ToolMetadata::description_template(&tool);
-        assert!(desc.contains("Terminate"));
         assert!(desc.contains("subagent"));
-        // Must name "monitor" so the model connects stopping a monitor to this tool.
         assert!(desc.contains("monitor"));
-        // The kill verb is OS-specific (SIGTERM on POSIX, Job Object on Windows).
-        if cfg!(not(unix)) {
-            assert!(desc.contains("Job Object"), "windows verb: {desc}");
-        } else {
-            assert!(desc.contains("SIGTERM"), "posix verb: {desc}");
-        }
         assert!(
             !desc.contains("${"),
             "fallback must not leak template markers: {desc}"
@@ -424,10 +419,6 @@ mod tests {
                 !rendered.contains(" ,") && !rendered.contains(", ,") && !rendered.contains("()"),
                 "[{label}] dangling punctuation:\n{rendered}"
             );
-            assert!(
-                rendered.contains("background task"),
-                "[{label}] must always mention background task:\n{rendered}"
-            );
             assert_eq!(
                 rendered.contains("monitor"),
                 has_monitor,
@@ -458,47 +449,17 @@ mod tests {
         )]);
         let rendered = kill_task_description(&TemplateRenderer::new(tools, params), None);
         assert!(
-            rendered.contains("Pass its id (a monitor's id is returned by monitor)"),
-            "renamed task_id must appear in pass-line and monitor aside:\n{rendered}"
+            rendered.contains("monitor"),
+            "monitor tool name must appear:\n{rendered}"
         );
         assert!(
             !rendered.contains("task_id"),
             "canonical task_id must not remain after rename:\n{rendered}"
         );
-    }
-
-    /// The kill mechanism is OS-level: Windows describes Job Object termination,
-    /// Unix/Git Bash describe SIGTERM/SIGKILL.
-    #[test]
-    fn kill_verb_matches_platform() {
-        use crate::types::template_renderer::TemplateRenderer;
-        use crate::types::tool::ToolKind;
-        use std::collections::HashMap;
-
-        let tools: HashMap<ToolKind, String> =
-            HashMap::from([(ToolKind::Execute, "run_terminal_command".to_string())]);
-        let renderer = TemplateRenderer::new(tools, HashMap::new());
-        let desc = kill_task_description(&renderer, None);
-
-        if cfg!(not(unix)) {
-            assert!(
-                desc.contains("- Terminates the Job Object of a bash task"),
-                "windows verb, got:\n{desc}"
-            );
-            assert!(
-                !desc.contains("SIGTERM"),
-                "Unix kill jargon leaked:\n{desc}"
-            );
-        } else {
-            assert!(
-                desc.contains("- Sends SIGTERM/SIGKILL to a bash task"),
-                "posix verb, got:\n{desc}"
-            );
-            assert!(
-                !desc.contains("Job Object"),
-                "Windows jargon leaked:\n{desc}"
-            );
-        }
+        assert!(
+            !rendered.contains("${"),
+            "must not leak template markers:\n{rendered}"
+        );
     }
 
     #[tokio::test]

@@ -3,240 +3,40 @@ pub mod watcher;
 use crate::bundle;
 use serde::Deserialize;
 pub use xai_grok_config_types::{
-    DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig, MemoryFlushConfig,
-    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemorySearchConfig,
-    MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
+    DEFAULT_RECENCY_DECAY, MemoryConfig, MemoryDreamConfig, MemoryDreamSettings,
+    MemoryEmbeddingConfig, MemoryEmbeddingSettings, MemoryFlushConfig, MemoryFlushSettings,
+    MemoryGcConfig, MemoryGcSettings, MemoryIndexConfig, MemoryIndexSettings,
+    MemoryInitialInjectionConfig, MemoryInitialInjectionSettings, MemorySearchConfig,
+    MemorySearchSettings, MemorySessionConfig, MemorySessionSettings, MemorySettings,
+    MemoryWatcherConfig, MemoryWatcherSettings, MmrConfig, MmrSettings, PruningConfig,
+    PruningSettings, TemporalDecayConfig, TemporalDecaySettings,
 };
-/// Full configuration for the memory system.
-///
-/// Parsed from the `[memory]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Disabled by default; enabled via
-/// `--experimental-memory` CLI flag or `GROK_MEMORY=1` env var.
-/// Force-disabled via `GROK_MEMORY=0` (overrides TOML and remote settings).
-///
-/// All sub-configs are pre-populated with production-ready defaults so that
-/// later PRs (indexing, search, flush, pruning) can read them without any
-/// config migration.
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(default)]
-pub struct MemoryConfig {
-    /// Whether memory is enabled for this session.
-    pub enabled: bool,
-    /// Index / chunking settings.
-    pub index: MemoryIndexConfig,
-    /// Embedding provider settings.
-    pub embedding: MemoryEmbeddingConfig,
-    /// Hybrid search scoring settings.
-    pub search: MemorySearchConfig,
-    /// First-turn memory injection behavior.
-    pub initial_injection: MemoryInitialInjectionConfig,
-    /// Session lifecycle settings.
-    pub session: MemorySessionConfig,
-    /// File watcher settings for detecting external memory edits.
-    pub watcher: MemoryWatcherConfig,
-    /// Garbage collection settings for orphaned workspace directories.
-    pub gc: MemoryGcConfig,
-    /// autoDream consolidation settings.
-    pub dream: MemoryDreamConfig,
-    /// Pre-compaction memory flush settings.
-    ///
-    /// **Note:** Configured under `[compaction.memory_flush]` in config.toml,
-    /// not under `[memory]`. Flush is a compaction behavior.
-    #[serde(skip)]
-    pub flush: MemoryFlushConfig,
-    /// Tool-result pruning settings.
-    ///
-    /// **Note:** Configured under `[compaction.pruning]` in config.toml,
-    /// not under `[memory]`. Pruning is a compaction behavior.
-    #[serde(skip)]
-    pub pruning: PruningConfig,
-    /// Per-agent memory root override (e.g. `~/.grok/agent-memory/<name>/`).
-    #[serde(skip)]
-    pub root_dir_override: Option<std::path::PathBuf>,
-    /// When true, the root is already project-scoped so MemoryStorage should
-    /// skip the workspace hash subdirectory (use `new_flat` instead of `new`).
-    #[serde(skip)]
-    pub flat_memory_root: bool,
-}
-impl MemoryConfig {
-    /// Resolve the final memory config from all sources (in priority order):
-    /// 1. CLI flag `--no-memory` (absolute highest — always disables, overrides all)
-    /// 2. CLI flag `--experimental-memory` (enables, but overridden by --no-memory)
-    /// 3. `GROK_MEMORY` env var: `1`/`true` enables, `0`/`false` force-disables
-    /// 4. Config file `[memory]` / `[compaction]` sections
-    /// 5. Remote settings from `/v1/settings`
-    ///
-    /// Remote settings only override fields when the corresponding local
-    /// config section is absent. Section-level granularity: if `[memory.search]`
-    /// exists in TOML, all search fields come from TOML; if absent, remote
-    /// search settings apply.
-    pub fn resolve(
-        experimental_memory: bool,
-        no_memory: bool,
-        config: &toml::Value,
-        remote: Option<&crate::util::config::RemoteSettings>,
-    ) -> Self {
-        let mut result: Self = config
-            .get("memory")
-            .and_then(|v| v.clone().try_into().ok())
-            .unwrap_or_default();
-        if let Some(compaction) = config.get("compaction") {
-            if let Some(flush) = compaction.get("memory_flush")
-                && let Ok(f) = flush.clone().try_into()
-            {
-                result.flush = f;
-            }
-            if let Some(pruning) = compaction.get("pruning")
-                && let Ok(p) = pruning.clone().try_into()
-            {
-                result.pruning = p;
-            }
-        }
-        if let Some(remote) = remote {
-            let has_local_search = config.get("memory").and_then(|m| m.get("search")).is_some();
-            if !has_local_search {
-                if let Some(v) = remote.memory_search_max_results {
-                    result.search.max_results = v as usize;
-                }
-                if let Some(v) = remote.memory_search_min_score {
-                    result.search.min_score = v;
-                }
-                if let Some(v) = remote.memory_temporal_decay_enabled {
-                    result.search.temporal_decay.enabled = v;
-                }
-                if let Some(v) = remote.memory_temporal_decay_half_life_days {
-                    result.search.temporal_decay.half_life_days = v;
-                }
-                if let Some(v) = remote.memory_mmr_enabled {
-                    result.search.mmr.enabled = v;
-                }
-                if let Some(v) = remote.memory_mmr_lambda {
-                    result.search.mmr.lambda = v.clamp(0.0, 1.0);
-                }
-            }
-            let has_local_initial_injection = config
-                .get("memory")
-                .and_then(|m| m.get("initial_injection"))
-                .is_some();
-            if !has_local_initial_injection {
-                if let Some(v) = remote.memory_initial_injection_enabled {
-                    result.initial_injection.enabled = v;
-                }
-                if let Some(v) = remote.memory_initial_injection_min_score {
-                    result.initial_injection.min_score = Some(v);
-                }
-            }
-            let has_local_embedding = config
-                .get("memory")
-                .and_then(|m| m.get("embedding"))
-                .is_some();
-            if !has_local_embedding {
-                if let Some(ref v) = remote.memory_embedding_model {
-                    result.embedding.model = Some(v.clone());
-                }
-                if let Some(v) = remote.memory_embedding_dimensions {
-                    result.embedding.dimensions = v as usize;
-                }
-            }
-            let has_local_pruning = config
-                .get("compaction")
-                .and_then(|c| c.get("pruning"))
-                .is_some();
-            if !has_local_pruning {
-                if let Some(v) = remote.pruning_enabled {
-                    result.pruning.enabled = v;
-                }
-                if let Some(v) = remote.pruning_keep_last_n_turns {
-                    result.pruning.keep_last_n_turns = v as usize;
-                }
-                if let Some(v) = remote.pruning_soft_trim_threshold {
-                    result.pruning.soft_trim_threshold = v as usize;
-                }
-            }
-            let has_local_flush = config
-                .get("compaction")
-                .and_then(|c| c.get("memory_flush"))
-                .is_some();
-            if !has_local_flush {
-                if let Some(v) = remote.flush_enabled {
-                    result.flush.enabled = v;
-                }
-                if let Some(v) = remote.flush_soft_threshold_tokens {
-                    result.flush.soft_threshold_tokens = v;
-                }
-                if let Some(v) = remote.flush_idle_timeout_secs {
-                    result.flush.idle_timeout_secs = Some(v);
-                }
-                if let Some(v) = remote.flush_semantic_dedup_threshold {
-                    result.flush.semantic_dedup_threshold = Some(v.clamp(0.0, 1.0));
-                }
-            }
-            let has_local_watcher = config
-                .get("memory")
-                .and_then(|m| m.get("watcher"))
-                .is_some();
-            if !has_local_watcher && let Some(v) = remote.memory_watcher_enabled {
-                result.watcher.enabled = v;
-            }
-            let has_local_dream = config.get("memory").and_then(|m| m.get("dream")).is_some();
-            if !has_local_dream {
-                if let Some(v) = remote.dream_enabled {
-                    result.dream.enabled = v;
-                }
-                if let Some(v) = remote.dream_min_hours {
-                    result.dream.min_hours = v;
-                }
-                if let Some(v) = remote.dream_min_sessions {
-                    result.dream.min_sessions = v;
-                }
-                if let Some(v) = remote.dream_check_interval_secs {
-                    result.dream.check_interval_secs = Some(v);
-                }
-            }
-        }
-        let resolved = crate::agent::config::resolve_enabled(
-            if experimental_memory {
-                Some(true)
-            } else {
-                None
-            },
-            "GROK_MEMORY",
-            result.enabled,
-            config.get("memory").is_some(),
-            remote.and_then(|r| r.memory_enabled),
-            false,
-        );
-        result.enabled = resolved.value;
-        if no_memory {
-            result.enabled = false;
-        }
-        result
-    }
-}
 /// Configuration for subagent (task tool) support.
 ///
 /// Parsed from the `[subagents]` section of `~/.grok/config.toml` or
-/// `.grok/config.toml`. Enabled by default; can be disabled via
-/// `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false`
-/// in config.toml.
+/// `.grok/config.toml`.
+/// Enabled by default; can be disabled via the `GROK_SUBAGENTS=0` env var or `[subagents] enabled = false` in config.toml.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SubagentsConfig {
     /// Whether subagent support is enabled.
     pub enabled: bool,
-    /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped ≥1 at resolve).
+    /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped to at least 1 at resolve).
     #[serde(default)]
     pub max_depth: Option<i64>,
     #[serde(default)]
     pub max_concurrent: Option<i64>,
+    /// Concurrent subagent turn-sampling limit. See [`Self::resolve_sampling_limit`].
+    #[serde(default)]
+    pub sampling_limit: Option<i64>,
     /// `"queue"` or `"fail"`.
     #[serde(default)]
     pub limit_behavior: Option<String>,
     #[serde(default)]
     pub workflow_max_concurrent: Option<i64>,
     /// Per-subagent model ID overrides.
-    /// Keys are agent names, values are model IDs that must exist in the
-    /// available models registry. Parsed from `[subagents.models]` in config.toml.
+    /// Keys are agent names, values are model IDs that must exist in the available models registry.
+    /// Parsed from `[subagents.models]` in config.toml.
     ///
     /// ```toml
     /// [subagents.models]
@@ -391,14 +191,13 @@ impl SubagentsConfig {
     /// Discover personas from `.grok/personas/` directory.
     ///
     /// File-based personas are loaded from `{cwd}/.grok/personas/*.toml`.
-    /// Each file defines a single `SubagentPersona`. The file stem becomes
-    /// the persona name. Inline config takes precedence.
+    /// Each file defines a single `SubagentPersona`. The file stem becomes the persona name.
+    /// Inline config takes precedence.
     pub(crate) fn discover_personas(&mut self, cwd: &std::path::Path) {
         let dir = cwd.join(".grok").join("personas");
         self.discover_personas_in_dir(&dir);
     }
-    /// Validate all role definitions. Returns a list of (role_name, error_message)
-    /// for invalid entries.
+    /// Validate all role definitions. Returns a list of (role_name, error_message) for invalid entries.
     pub fn validate_roles(&self) -> Vec<(String, String)> {
         let valid_modes = ["read-only", "read-write", "execute", "all"];
         let mut errors = Vec::new();
@@ -431,9 +230,8 @@ impl SubagentsConfig {
     }
     /// Discover roles from `.grok/roles/` directory and merge with inline config.
     ///
-    /// File-based roles are loaded from `{cwd}/.grok/roles/*.toml`. Each file
-    /// defines a single `SubagentRole` (same schema as inline `[subagents.roles.*]`).
-    /// The file stem becomes the role name.
+    /// File-based roles are loaded from `{cwd}/.grok/roles/*.toml`.
+    /// Each file defines a single `SubagentRole` (same schema as inline `[subagents.roles.*]`). The file stem becomes the role name.
     ///
     /// Precedence: inline config roles override file-based roles with the same name.
     pub(crate) fn discover_roles(&mut self, cwd: &std::path::Path) {
@@ -442,8 +240,7 @@ impl SubagentsConfig {
     }
     pub const ENV_MAX_DEPTH: &'static str = "GROK_SUBAGENTS_MAX_DEPTH";
     pub const DEFAULT_MAX_DEPTH: u32 = 1;
-    /// Clamp to `1..=u32::MAX`. Values below 1 (including 0 / negatives) warn
-    /// and become 1 so nesting is never accidentally disabled.
+    /// Clamp to `1..=u32::MAX`. Values below 1 (including 0 and negatives) warn and become 1 so nesting is never accidentally disabled.
     pub(crate) fn clamp_max_depth(raw: i64, source: &str) -> u32 {
         if raw < i64::from(Self::DEFAULT_MAX_DEPTH) {
             tracing::warn!(
@@ -465,9 +262,8 @@ impl SubagentsConfig {
     }
     /// Precedence: env > TOML > remote > [`Self::DEFAULT_MAX_DEPTH`].
     ///
-    /// Depth 0 is the top-level session; a child is parent+1. Spawn is rejected
-    /// when `depth >= max`. So `max = 1` allows only top-level spawns; nested
-    /// spawns from a first-level subagent need `max >= 2`.
+    /// Depth 0 is the top-level session; a child is parent+1. Spawn is rejected when `depth >= max`.
+    /// So `max = 1` allows only top-level spawns; nested spawns from a first-level subagent need `max >= 2`.
     pub(crate) fn resolve_max_depth(
         env: Option<&str>,
         config: Option<i64>,
@@ -493,51 +289,15 @@ impl SubagentsConfig {
         Self::DEFAULT_MAX_DEPTH
     }
     pub const ENV_MAX_CONCURRENT: &'static str = "GROK_MAX_CONCURRENT_SUBAGENTS";
+    pub const ENV_SAMPLING_LIMIT: &'static str = "GROK_SUBAGENT_SAMPLING_LIMIT";
     pub const ENV_LIMIT_BEHAVIOR: &'static str = "GROK_SUBAGENT_LIMIT_BEHAVIOR";
     pub const ENV_WORKFLOW_MAX_CONCURRENT: &'static str = "GROK_WORKFLOW_MAX_CONCURRENT_AGENTS";
-    /// Clamp to `1..`; a limit can be adjusted but never disabled.
-    fn clamp_count(value: i64, source: &str, name: &str) -> usize {
-        if value < 1 {
-            tracing::warn!(source, name, value, "subagent limit < 1; clamping to 1");
-            1
-        } else {
-            usize::try_from(value).unwrap_or(usize::MAX)
-        }
-    }
-    /// Precedence: env > TOML > remote > default; invalid layers warn and fall through.
-    fn resolve_count(
-        env_name: &str,
-        env: Option<&str>,
-        config: Option<i64>,
-        remote: Option<u32>,
-        default: usize,
-    ) -> usize {
-        if let Some(value) = env {
-            match xai_grok_tools::util::env::parse_positive(value.trim()) {
-                Some(parsed) => return usize::try_from(parsed).unwrap_or(usize::MAX),
-                None => {
-                    tracing::warn!(
-                        name = env_name,
-                        %value,
-                        "invalid env value (expected a positive whole number); ignoring"
-                    );
-                }
-            }
-        }
-        if let Some(v) = config {
-            return Self::clamp_count(v, "config", env_name);
-        }
-        if let Some(v) = remote {
-            return Self::clamp_count(i64::from(v), "remote", env_name);
-        }
-        default
-    }
     pub(crate) fn resolve_max_concurrent(
         env: Option<&str>,
         config: Option<i64>,
         remote: Option<u32>,
     ) -> usize {
-        Self::resolve_count(
+        resolve_positive_count(
             Self::ENV_MAX_CONCURRENT,
             env,
             config,
@@ -545,12 +305,34 @@ impl SubagentsConfig {
             xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT,
         )
     }
+    /// Resolve the subagent turn-sampling limit, clamped to [`crate::agent::subagent::MAX_SUBAGENT_SAMPLING_LIMIT`].
+    /// `default` is the resolved concurrent-subagent bound (`GROK_MAX_CONCURRENT_SUBAGENTS`).
+    /// A lower `GROK_SUBAGENT_SAMPLING_LIMIT`, `[subagents] sampling_limit`, or remote value caps sampling further.
+    pub(crate) fn resolve_sampling_limit(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+        default: usize,
+    ) -> usize {
+        let max = crate::agent::subagent::MAX_SUBAGENT_SAMPLING_LIMIT;
+        let resolved =
+            resolve_positive_count(Self::ENV_SAMPLING_LIMIT, env, config, remote, default);
+        if resolved > max {
+            tracing::warn!(
+                name = Self::ENV_SAMPLING_LIMIT,
+                resolved,
+                max,
+                "subagent sampling limit exceeds the ceiling; clamping"
+            );
+        }
+        resolved.min(max)
+    }
     pub(crate) fn resolve_workflow_max_concurrent(
         env: Option<&str>,
         config: Option<i64>,
         remote: Option<u32>,
     ) -> usize {
-        Self::resolve_count(
+        resolve_positive_count(
             Self::ENV_WORKFLOW_MAX_CONCURRENT,
             env,
             config,
@@ -581,17 +363,15 @@ impl SubagentsConfig {
         LimitBehavior::Queue
     }
     /// Resolve the final subagents config from all sources (in priority order):
-    /// 1. CLI flag `--subagents` (absolute highest — always enables)
+    /// 1. CLI flag `--subagents` (absolute highest, always enables)
     /// 2. `GROK_SUBAGENTS` env var: `1`/`true` enables, `0`/`false` force-disables
     /// 3. Config file `[subagents]` section
     /// 4. Default (enabled)
     ///
-    /// `enabled` is deliberately not remotely gated — only explicit local
-    /// intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes
-    /// the default.
+    /// `enabled` is deliberately not remotely gated.
+    /// Only explicit local intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes the default.
     ///
-    /// Project files are excluded from this trust-independent base; Task
-    /// boundaries overlay them using the parent cwd's authoritative trust verdict.
+    /// Project files are excluded from this trust-independent base; Task boundaries overlay them using the parent cwd's authoritative trust verdict.
     pub fn resolve(cli_flag: bool, config: &toml::Value) -> Self {
         let user_grok_root = xai_grok_config::user_grok_home();
         Self::resolve_base_with_sources(
@@ -718,10 +498,10 @@ pub(crate) struct ModelOverrideConfig {
     pub web_search: String,
     /// `None` = current model.
     pub session_summary: Option<String>,
-    /// Compiled default (`grok-build`) when unset locally, remotely, and via env.
+    /// Compiled default (`grok-4.6`) when unset locally, remotely, and via env.
     pub image_description: Option<String>,
-    /// Next-prompt suggestion model pin. Unlike the other overrides this does
-    /// NOT fill a compiled default — see [`PromptSuggestModelPin`].
+    /// Next-prompt suggestion model pin.
+    /// Unlike the other overrides this does NOT fill a compiled default; see [`PromptSuggestModelPin`].
     #[serde(skip)]
     pub prompt_suggestion: PromptSuggestModelPin,
 }
@@ -735,31 +515,21 @@ impl Default for ModelOverrideConfig {
         }
     }
 }
-/// Resolved model pin for the next-prompt suggestion call (tab-autocomplete
-/// ghost text), `env > config.toml > remote` — see
-/// [`ModelOverrideConfig::resolve`].
+/// Resolved model pin for the next-prompt suggestion call (tab-autocomplete ghost text).
+/// Precedence is `env > config.toml > remote`; see [`ModelOverrideConfig::resolve`].
 ///
-/// Unlike the other auxiliary overrides this does not collapse to a plain
-/// model string: the consumer (`handle_suggest_prompt`) must distinguish
-/// an explicit pin from "unpinned" (where the client hint and the built-in
-/// `grok-build-0.1` default apply), and whether the pin came from the env
-/// escape hatch. Every effective model except an env pin is catalog-guarded —
-/// when the model is not in the shell's catalog (e.g. `grok-build-0.1` for
-/// OAuth users, whose catalogs exclude it) the per-turn suggestion request is
-/// skipped entirely rather than fired doomed. The env pin is deliberately
-/// exempt so `GROK_PROMPT_SUGGESTIONS_MODEL` keeps working for models a
-/// catalog does not list (mirrors the pager, which forwards the env value
-/// without checking its catalog).
+/// Unlike the other auxiliary overrides this does not collapse to a plain model string.
+/// The consumer (`handle_suggest_prompt`) must distinguish an explicit pin from "unpinned".
+/// When unpinned, the client hint wins; otherwise reasoning-disabled sampling uses the alias and reasoning-enabled sampling uses the session model.
+/// Every effective model is catalog-guarded.
+/// A model missing from the shell's catalog skips the per-turn suggestion request instead of firing one that must fail.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PromptSuggestModelPin {
-    /// `GROK_PROMPT_SUGGESTIONS_MODEL` — used verbatim, bypasses the
-    /// catalog guard.
+    /// `GROK_PROMPT_SUGGESTIONS_MODEL`: catalog-guarded explicit pin.
     Env(String),
-    /// `[models] prompt_suggestion` in config.toml, or the remote
-    /// `prompt_suggestion_model` (remote settings) — catalog-guarded.
+    /// `[models] prompt_suggestion` in config.toml, or the remote `prompt_suggestion_model` (remote settings); catalog-guarded.
     Pinned(String),
-    /// No explicit pin: the client hint, then the built-in default apply
-    /// (both catalog-guarded).
+    /// No explicit pin: the client hint, then the built-in default apply (both catalog-guarded).
     #[default]
     Unpinned,
 }
@@ -776,11 +546,9 @@ fn non_empty_model_override(value: Option<&str>) -> Option<String> {
 }
 impl ModelOverrideConfig {
     /// CLI flag > env var > config.toml > remote settings > compiled default.
-    /// `image_description` and `session_summary` always resolve to `Some(_)`
-    /// (default `grok-build`), never the session model.
-    /// `prompt_suggestion` resolves to a [`PromptSuggestModelPin`] instead of
-    /// a model string (no CLI flag; the default and the catalog guard live at
-    /// the consumer, `handle_suggest_prompt`).
+    /// `image_description` and `session_summary` always resolve to `Some(_)` (default `grok-4.6`), never the session model.
+    /// `prompt_suggestion` resolves to a [`PromptSuggestModelPin`] instead of a model string.
+    /// It has no CLI flag; the default and the catalog guard live at the consumer, `handle_suggest_prompt`.
     pub(crate) fn resolve(
         cli_web_search_model: Option<&str>,
         cli_session_summary_model: Option<&str>,
@@ -860,6 +628,15 @@ impl ModelOverrideConfig {
         result
     }
 }
+/// Raw `[tools.media_gen]` counts; resolve via [`ToolsConfig::resolve_max_parallel_image_gen_calls`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct MediaGenToolsConfig {
+    #[serde(default)]
+    pub max_parallel_image_gen_calls: Option<i64>,
+    #[serde(default)]
+    pub max_parallel_video_gen_calls: Option<i64>,
+}
 /// Tool behavior configuration (`[tools]` in config.toml).
 ///
 /// Controls cross-cutting tool behavior such as `.gitignore` filtering.
@@ -867,39 +644,38 @@ impl ModelOverrideConfig {
 /// ```toml
 /// [tools]
 /// disable_zdr_incompatible_tools = true
+/// # [tools.media_gen] — see MediaGenToolsConfig
 /// # [tools.zdr_video_output_s3] — see ZdrVideoOutputS3Config
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
-    /// When `true`, all tools (including `read_file`) filter gitignored
-    /// files. When `false` (default), each tool picks its own default.
+    /// When `true`, all tools (including `read_file`) filter gitignored files.
+    /// When `false` (default), each tool picks its own default.
     pub respect_gitignore: bool,
-    /// Restrict tools whose xAI API requires server-side artifact storage
-    /// (currently just the video tools): without a valid
-    /// `[tools.zdr_video_output_s3]` bucket they stay advertised but return
-    /// setup guidance at call time. Intended for ZDR-bound teams via
+    /// Restrict tools whose xAI API requires server-side artifact storage (currently just the video tools).
+    /// Without a valid `[tools.zdr_video_output_s3]` bucket they stay advertised but return setup guidance at call time.
+    /// Intended for ZDR-bound teams via
     /// `~/.grok/managed_config.toml`. Defaults to `false`.
     pub disable_zdr_incompatible_tools: bool,
-    /// Optional S3 bucket config for ZDR video output. When present (and
-    /// valid), video tools presign an upload URL and pass it to the API so
-    /// the generated video lands in a team-owned bucket instead of being
-    /// downloaded locally. Only effective when `disable_zdr_incompatible_tools`
-    /// is `true`. Populated from `[tools.zdr_video_output_s3]` in config.
+    /// Optional S3 bucket config for ZDR video output.
+    /// When present (and valid), video tools presign an upload URL and pass it to the API.
+    /// The generated video then lands in a team-owned bucket instead of being downloaded locally.
+    /// Only effective when `disable_zdr_incompatible_tools` is `true`. Populated from `[tools.zdr_video_output_s3]` in config.
     pub zdr_video_output_s3:
         Option<xai_grok_tools::implementations::grok_build::video_gen::ZdrVideoOutputS3Config>,
+    pub media_gen: MediaGenToolsConfig,
 }
 impl ToolsConfig {
+    pub const ENV_MAX_PARALLEL_IMAGE_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_IMAGE_GEN_CALLS";
+    pub const ENV_MAX_PARALLEL_VIDEO_GEN_CALLS: &'static str = "GROK_MAX_PARALLEL_VIDEO_GEN_CALLS";
     /// Resolve the final tools config, in priority order:
-    /// 1. Env vars `GROK_RESPECT_GITIGNORE` and
-    ///    `GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS` (`0`/`false` off,
-    ///    `1`/`true` on).
+    /// 1. Env vars `GROK_RESPECT_GITIGNORE` and `GROK_DISABLE_ZDR_INCOMPATIBLE_TOOLS` (`0`/`false` off, `1`/`true` on).
     /// 2. `[tools]` block from the merged effective config.
     /// 3. Defaults (both `false`).
     ///
-    /// Fields are read individually so a malformed
-    /// `[tools.zdr_video_output_s3]` cannot wipe `disable_zdr_incompatible_tools`
-    /// (or any other tools flag) via whole-table deserialize failure.
+    /// Fields are read individually.
+    /// A malformed `[tools.zdr_video_output_s3]` therefore cannot wipe `disable_zdr_incompatible_tools` or any other tools flag.
     pub fn resolve(config: &toml::Value) -> Self {
         let tools = config.get("tools");
         let mut result = Self {
@@ -934,6 +710,16 @@ impl ToolsConfig {
                         None
                     }
                 }),
+            media_gen: MediaGenToolsConfig {
+                max_parallel_image_gen_calls: tools
+                    .and_then(|t| t.get("media_gen"))
+                    .and_then(|m| m.get("max_parallel_image_gen_calls"))
+                    .and_then(|v| v.as_integer()),
+                max_parallel_video_gen_calls: tools
+                    .and_then(|t| t.get("media_gen"))
+                    .and_then(|m| m.get("max_parallel_video_gen_calls"))
+                    .and_then(|v| v.as_integer()),
+            },
         };
         match std::env::var("GROK_RESPECT_GITIGNORE").as_deref() {
             Ok("0") | Ok("false") => {
@@ -955,6 +741,98 @@ impl ToolsConfig {
         }
         result
     }
+    pub(crate) fn resolve_max_parallel_image_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_clamped_count(
+            Self::ENV_MAX_PARALLEL_IMAGE_GEN_CALLS,
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_IMAGE_GEN,
+        )
+    }
+    pub(crate) fn resolve_max_parallel_video_gen_calls(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> usize {
+        resolve_clamped_count(
+            Self::ENV_MAX_PARALLEL_VIDEO_GEN_CALLS,
+            env,
+            config,
+            remote,
+            xai_grok_tools::media_gen_limits::DEFAULT_MAX_PARALLEL_VIDEO_GEN,
+        )
+    }
+}
+/// Media-gen ladder: env > TOML > remote > default, with every numeric layer clamping `< 1` to `1`.
+/// Non-numeric env warns and falls through.
+fn resolve_clamped_count(
+    env_name: &str,
+    env: Option<&str>,
+    config: Option<i64>,
+    remote: Option<u32>,
+    default: usize,
+) -> usize {
+    if let Some(raw) = env {
+        match raw.trim().parse::<i64>() {
+            Ok(v) => return clamp_positive_count(v, "env", env_name),
+            Err(_) => {
+                tracing::warn!(
+                    name = env_name,
+                    %raw,
+                    "invalid env value (expected a whole number); ignoring"
+                );
+            }
+        }
+    }
+    if let Some(v) = config {
+        return clamp_positive_count(v, "config", env_name);
+    }
+    if let Some(v) = remote {
+        return clamp_positive_count(i64::from(v), "remote", env_name);
+    }
+    default
+}
+/// Positive whole-number ladder: env > TOML > remote > default.
+/// Invalid/non-positive env warns and falls through; TOML/remote `< 1` clamp to 1.
+pub(crate) fn resolve_positive_count(
+    env_name: &str,
+    env: Option<&str>,
+    config: Option<i64>,
+    remote: Option<u32>,
+    default: usize,
+) -> usize {
+    if let Some(value) = env {
+        match xai_grok_tools::util::env::parse_positive(value.trim()) {
+            Some(parsed) => return usize::try_from(parsed).unwrap_or(usize::MAX),
+            None => {
+                tracing::warn!(
+                    name = env_name,
+                    %value,
+                    "invalid env value (expected a positive whole number); ignoring"
+                );
+            }
+        }
+    }
+    if let Some(v) = config {
+        return clamp_positive_count(v, "config", env_name);
+    }
+    if let Some(v) = remote {
+        return clamp_positive_count(i64::from(v), "remote", env_name);
+    }
+    default
+}
+fn clamp_positive_count(value: i64, source: &str, name: &str) -> usize {
+    if value < 1 {
+        tracing::warn!(source, name, value, "positive count < 1; clamping to 1");
+        1
+    } else {
+        usize::try_from(value).unwrap_or(usize::MAX)
+    }
 }
 /// Storage mode for session persistence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -962,7 +840,7 @@ pub enum StorageMode {
     /// Local JSONL only (default)
     #[default]
     Local,
-    /// Local + HTTP flush at end of turn
+    /// Local JSONL plus an HTTP flush at end of turn
     Writeback,
 }
 impl StorageMode {
@@ -992,10 +870,9 @@ impl StorageMode {
         }
         Self::Local
     }
-    /// Resolve from remote settings, enforcing the rule that `Writeback`
-    /// requires grok.com auth (it syncs to grok-code-backend). This is the
-    /// single home for that gate, used at boot ([`crate::agent::init`]) and by
-    /// the post-readiness self-heal (`MvpAgent::reapply_storage_mode`).
+    /// Resolve from remote settings, enforcing the rule that `Writeback` requires grok.com auth (it syncs session history to the user's account).
+    /// This is the single home for that gate.
+    /// It is used at boot ([`crate::agent::init`]) and by the post-readiness self-heal (`MvpAgent::reapply_storage_mode`).
     pub(crate) fn from_remote_gated(
         remote: Option<&crate::util::config::RemoteSettings>,
         has_xai_auth: bool,
@@ -1008,13 +885,15 @@ impl StorageMode {
 }
 pub use xai_grok_config::ConfigLayers;
 pub use xai_grok_config::{
-    MDM_REQUIREMENTS_SOURCE, RequirementsLayer, RequirementsSource, ServingIdentity, SyncMarker,
+    GROK_CONFIG_ENV, GROK_CONFIG_PATH_ENV, MDM_REQUIREMENTS_SOURCE, OverlaySource,
+    RequirementsLayer, RequirementsSource, ResolvedOverlay, ServingIdentity, SyncMarker,
     claude_managed_settings_probe_path, confirmed_team_switch, confirmed_team_switch_at,
     is_managed_config_hard_stale_for, is_managed_config_stale_for, load_config_file,
     load_from_disk, load_managed_config, load_merged_requirements, load_system_managed_config,
     load_toml_file, managed_config_identity_changed_at, managed_deployment_id,
     managed_policy_compromised_for, mark_managed_config_synced, mark_managed_config_synced_at,
-    normalize_identity, requirements_layers, system_config_dir, user_grok_home,
+    normalize_identity, requirements_layers, resolved_env_overlay, system_config_dir,
+    user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
 pub(crate) fn config_origins(
@@ -1044,6 +923,9 @@ pub(crate) fn config_origins(
         ConfigSource::UserConfig,
         &mut origins,
     );
+    if let Some(overlay) = &layers.env_overlay {
+        walk_toml(overlay, &mut vec![], ConfigSource::EnvOverlay, &mut origins);
+    }
     origins
 }
 fn walk_toml(
@@ -1065,13 +947,12 @@ fn walk_toml(
         }
     }
 }
-/// The `[skills]` table from an effective config, shared by the reload
-/// dispatch and `grok inspect`.
+/// The `[skills]` table from an effective config, shared by the reload dispatch and `grok inspect`.
 pub(crate) use crate::config::reloader::parse_skills_config;
-/// Effective config: layers + campaign overlay (remote cache + `GROK_CAMPAIGNS_OVERRIDE`).
+/// Effective config: the layers plus the campaign overlay (remote cache and `GROK_CAMPAIGNS_OVERRIDE`).
 pub use crate::util::config::load_effective_config;
-/// Effective config with disk campaigns only — for one-shot entrypoints that
-/// never fetch remote settings (avoids resolving against a never-seeded cache).
+/// Effective config with disk campaigns only, for one-shot entrypoints that never fetch remote settings.
+/// This avoids resolving against a never-seeded cache.
 pub use crate::util::config::load_effective_config_disk_only;
 /// Where a requirement or permission rule was loaded from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1150,19 +1031,40 @@ fn apply_managed_settings_features_inner(
         });
     }
     if features.disable_feedback == Some(true) {
-        config.features.feedback = Some(false);
+        use crate::agent::config::Feature;
+        config.feature_values.insert(Feature::Feedback, false);
         enforced.push(EnforcedField {
-            path: "features.feedback",
+            path: Feature::Feedback.path(),
             value: "false (DISABLE_FEEDBACK_COMMAND)".to_string(),
             source: source.clone(),
         });
     }
     enforced
 }
+/// Load the on-disk config for a one-shot command and clamp it with policy.
+/// Without the clamp a pinned value reads as an ordinary config value, which the environment outranks.
+pub fn load_agent_config_disk_only() -> Result<crate::agent::config::Config, String> {
+    let effective = load_effective_config_disk_only().map_err(|e| e.to_string())?;
+    let mut config = crate::agent::config::Config::new_from_toml_cfg(&effective)?;
+    apply_policy(&mut config);
+    Ok(config)
+}
+/// Clamp a config with managed settings and then requirements pins, logging each field a policy took over.
+/// Requirements run second so a pin wins a conflict.
+pub(crate) fn apply_policy(config: &mut crate::agent::config::Config) {
+    let managed = apply_managed_settings_features(config);
+    let pinned = apply_requirements(config);
+    for field in managed.iter().chain(&pinned) {
+        tracing::info!(
+            field = %field.path, value = %field.value, source = %field.source,
+            "policy override"
+        );
+    }
+}
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
 pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
-    requirements_layers()
+    let enforced: Vec<EnforcedField> = requirements_layers()
         .into_iter()
         .flat_map(|layer| {
             apply_requirements_inner(
@@ -1173,7 +1075,18 @@ pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> V
                 },
             )
         })
-        .collect()
+        .collect();
+    keep_the_deciding_layer(enforced)
+}
+/// Layers arrive user first, system last, and the last write is the pin that holds.
+/// Report that one, so an operator reading the log sees the file that decided rather than the first that asked.
+/// Keyed by value as well as path, because one layer can enforce the same path twice for different reasons.
+fn keep_the_deciding_layer(mut enforced: Vec<EnforcedField>) -> Vec<EnforcedField> {
+    let mut seen = std::collections::HashSet::new();
+    enforced.reverse();
+    enforced.retain(|field| seen.insert((field.path, field.value.clone())));
+    enforced.reverse();
+    enforced
 }
 fn apply_requirements_inner(
     config: &mut crate::agent::config::Config,
@@ -1181,7 +1094,17 @@ fn apply_requirements_inner(
     source: &RequirementSource,
 ) -> Vec<EnforcedField> {
     fn req_bool(req: &toml::Value, section: &str, key: &str) -> Option<bool> {
-        req.get(section)?.get(key)?.as_bool()
+        let value = req.get(section)?.get(key)?;
+        let parsed = value.as_bool();
+        if parsed.is_none() {
+            tracing::error!(
+                section,
+                key,
+                kind = value.type_str(),
+                "requirements value is not a boolean; the constraint is not applied"
+            );
+        }
+        parsed
     }
     fn req_str<'a>(req: &'a toml::Value, section: &str, key: &str) -> Option<&'a str> {
         req.get(section)?.get(key)?.as_str()
@@ -1198,10 +1121,10 @@ fn apply_requirements_inner(
         ($name:ident) => {
             if let Some(val) = req_bool(req, "features", stringify!($name)) {
                 config.requirements.$name.pin(val, source.clone());
-                if config.features.$name != Some(val) {
-                    config.features.$name = Some(val);
-                    push(concat!("features.", stringify!($name)), format!("{val}"));
-                }
+                config.features.$name = Some(val);
+                // Unconditional, like the registry loop
+                // A later layer repeating the pin must report, or the dedupe keeps the first layer that asked instead of the one that decided
+                push(concat!("features.", stringify!($name)), format!("{val}"));
             }
         };
     }
@@ -1244,16 +1167,33 @@ fn apply_requirements_inner(
             }
         };
     }
-    pin_feature!(feedback);
-    pin_feature!(lsp_tools);
-    pin_feature!(web_fetch);
-    pin_feature!(ask_user_question);
     pin_feature!(image_gen);
     pin_requirement_only!(image_edit);
     pin_feature!(video_gen);
-    pin_feature!(write_file);
-    pin_feature!(voice_mode);
+    for spec in crate::agent::config::FEATURES {
+        let Some(value) = req
+            .get("features")
+            .and_then(|features| features.get(spec.key))
+        else {
+            continue;
+        };
+        let Some(val) = value.as_bool() else {
+            tracing::error!(
+                path = spec.path,
+                kind = value.type_str(),
+                source = %source,
+                "requirements pin is not a boolean; the pin is ignored until the next launch, \
+                 which will refuse to start"
+            );
+            continue;
+        };
+        config
+            .requirements
+            .pin_feature(spec.id, val, source.clone());
+        push(spec.path, format!("{val}"));
+    }
     pin_requirement_only!(remote_fetch);
+    pin_requirement_only!(title_refresh);
     if let Some(val) = req_bool(req, "telemetry", "trace_upload") {
         config.requirements.trace_upload.pin(val, source.clone());
         if config.telemetry.trace_upload != Some(val) {
@@ -1264,7 +1204,7 @@ fn apply_requirements_inner(
     enforce_opt!("cli", "auto_update", config.cli.auto_update);
     enforce_opt!("cli", "use_leader", config.cli.use_leader);
     enforce_opt!("cli", "show_tips", config.cli.show_tips);
-    enforce_val!("memory", "enabled", config.memory.enabled);
+    enforce_opt!("memory", "enabled", config.memory.enabled);
     enforce_val!("subagents", "enabled", config.subagents.enabled);
     enforce_val!("managed_mcps", "enabled", config.managed_mcps.enabled);
     if let Some(val) = req_bool(req, "tools", "respect_gitignore") {
@@ -1443,10 +1383,33 @@ fn apply_requirements_inner(
     }
     enforced
 }
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum BwrapStartup<T> {
+    ReexecRequired(T),
+    ReexecOptional(T),
+    Verify,
+    Refuse,
+    Continue,
+}
+#[cfg(target_os = "linux")]
+fn route_bwrap_startup<T>(
+    command: Option<T>,
+    is_inside_bwrap: bool,
+    requires_bwrap: bool,
+) -> BwrapStartup<T> {
+    match command {
+        Some(command) if requires_bwrap => BwrapStartup::ReexecRequired(command),
+        Some(command) => BwrapStartup::ReexecOptional(command),
+        None if requires_bwrap && is_inside_bwrap => BwrapStartup::Verify,
+        None if requires_bwrap => BwrapStartup::Refuse,
+        None => BwrapStartup::Continue,
+    }
+}
 /// Resolve sandbox profile and apply OS-level enforcement. Called once at startup.
 ///
-/// `cli_profile` is the resumed/forced base profile (a resumed session's saved
-/// profile, or an explicit `--sandbox`); it wins over a fresh env/config read.
+/// `cli_profile` is the resumed/forced base profile (a resumed session's saved profile, or an explicit `--sandbox`).
+/// It wins over a fresh env/config read.
 pub fn apply_sandbox(
     sandbox_config: Option<&crate::agent::config::SandboxSettingsConfig>,
     cli_profile: Option<&str>,
@@ -1485,7 +1448,10 @@ pub fn apply_sandbox(
     let requires_hook_write_deny =
         xai_grok_sandbox::requires_hook_write_deny(&sandbox_profile, &workspace);
     #[cfg(target_os = "linux")]
-    let requires_bwrap = requires_read_deny || requires_hook_write_deny;
+    let requires_data_write_deny =
+        xai_grok_sandbox::requires_data_write_deny(&sandbox_profile, &workspace);
+    #[cfg(target_os = "linux")]
+    let requires_bwrap = requires_read_deny || requires_hook_write_deny || requires_data_write_deny;
     #[cfg(target_os = "linux")]
     {
         let refuse_unprotected = |cause: &str| {
@@ -1494,24 +1460,27 @@ pub fn apply_sandbox(
                  {cause} Refusing to start with denied paths unprotected."
             );
         };
-        match xai_grok_sandbox::bwrap_reexec_for_profile(&sandbox_profile, &workspace) {
-            Some(mut cmd) => {
+        let command = xai_grok_sandbox::bwrap_reexec_for_profile(&sandbox_profile, &workspace);
+        match route_bwrap_startup(command, xai_grok_sandbox::is_inside_bwrap(), requires_bwrap) {
+            BwrapStartup::ReexecRequired(mut cmd) => {
                 use std::os::unix::process::CommandExt;
                 let err = cmd.exec();
-                if requires_bwrap {
-                    refuse_unprotected(&format!(
-                        "bwrap exec failed: {err}. Install bubblewrap with \
-                         `apt install -y bubblewrap`."
-                    ));
-                    std::process::exit(1);
-                }
+                refuse_unprotected(&format!(
+                    "bwrap exec failed: {err}. Install bubblewrap with \
+                     `apt install -y bubblewrap`."
+                ));
+                std::process::exit(1);
+            }
+            BwrapStartup::ReexecOptional(mut cmd) => {
+                use std::os::unix::process::CommandExt;
+                let err = cmd.exec();
                 eprintln!(
                     "WARNING: bwrap exec failed: {err}. \
                      Falling back to Landlock sandbox. \
                      Install bubblewrap: apt install -y bubblewrap"
                 );
             }
-            None if requires_bwrap && xai_grok_sandbox::is_inside_bwrap() => {
+            BwrapStartup::Verify => {
                 if requires_hook_write_deny
                     && let Err(e) = xai_grok_sandbox::verify_hook_write_deny_enforced()
                 {
@@ -1522,15 +1491,39 @@ pub fn apply_sandbox(
                     );
                     std::process::exit(1);
                 }
+                if requires_read_deny
+                    && let Err(e) =
+                        xai_grok_sandbox::verify_read_deny_enforced(&sandbox_profile, &workspace)
+                {
+                    eprintln!(
+                        "error: sandbox reports bwrap but required read-deny mounts \
+                         are not in effect ({e}); refusing to start \
+                         (possible __GROK_INSIDE_BWRAP spoof)"
+                    );
+                    std::process::exit(1);
+                }
+                if requires_data_write_deny
+                    && let Err(e) = xai_grok_sandbox::verify_data_write_deny_enforced(
+                        &sandbox_profile,
+                        &workspace,
+                    )
+                {
+                    eprintln!(
+                        "error: sandbox reports bwrap but the required /data write-deny \
+                         mount is not in effect ({e}); refusing to start \
+                         (possible __GROK_INSIDE_BWRAP spoof)"
+                    );
+                    std::process::exit(1);
+                }
             }
-            None if requires_bwrap => {
+            BwrapStartup::Refuse => {
                 refuse_unprotected(
-                    "the deny list could not be prepared; see the error above \
+                    "the required bwrap plan could not be prepared; see the error above \
                      for the specific cause.",
                 );
                 std::process::exit(1);
             }
-            None => {}
+            BwrapStartup::Continue => {}
         }
     }
     if sandbox_profile != xai_grok_sandbox::ProfileName::Off {
@@ -1547,12 +1540,7 @@ pub fn apply_sandbox(
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            #[cfg(target_os = "macos")]
             let unappliable = requires_protection && !sandbox.is_applied();
-            #[cfg(target_os = "linux")]
-            let unappliable = requires_protection
-                && !sandbox.is_applied()
-                && !xai_grok_sandbox::is_inside_bwrap();
             if unappliable {
                 eprintln!(
                     "error: could not apply the '{}' sandbox profile; see the \
@@ -1578,16 +1566,14 @@ pub fn apply_sandbox(
     }
 }
 pub use xai_grok_workspace::project_config::find_project_configs;
-/// Resolve the effective `[plugins]` config for a working directory the same
-/// way a session does at reload time: global/user config
-/// ([`load_effective_config`]) plus every ancestor project `.grok/config.toml`
-/// ([`find_project_configs`], extending `paths` and `disabled`) plus the
-/// imported `enabledPlugins` merge.
+/// Resolve the effective `[plugins]` config for a working directory the same way a session does at reload time:
+/// global/user config ([`load_effective_config`]),
+/// plus every ancestor project `.grok/config.toml` ([`find_project_configs`], extending `paths` and `disabled`),
+/// plus the imported `enabledPlugins` merge.
 ///
-/// Shared by `reload_plugins_impl`, `x.ai/commands/list`, and the agent's
-/// eager plugin-registry fan-out so all three discover the same plugins for a
-/// given cwd. Centralizing it prevents the paths/disabled/discovered-command
-/// drift those callers would otherwise accumulate.
+/// Shared by `reload_plugins_impl`, `x.ai/commands/list`, and the agent's eager plugin-registry fan-out.
+/// All three must discover the same plugins for a given cwd.
+/// Centralizing it prevents the paths/disabled/discovered-command drift those callers would otherwise accumulate.
 pub(crate) fn resolve_effective_plugins_config(
     cwd: &std::path::Path,
 ) -> crate::agent::config::PluginsConfig {
@@ -1801,8 +1787,7 @@ pub fn add_dismissed_plugin_cta_to_file(
 }
 /// All plugin ids listed in `[plugin_cta].dismissed` in `~/.grok/config.toml`.
 ///
-/// Read once (e.g. on catalog load) and cached so the matched-debounce recompute
-/// doesn't parse the config from disk on the UI thread.
+/// Read once (e.g. on catalog load) and cached so the matched-debounce recompute doesn't parse the config from disk on the UI thread.
 pub fn dismissed_plugin_ctas() -> std::collections::HashSet<String> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
     dismissed_plugin_ctas_in_file(&config_path)
@@ -1989,11 +1974,25 @@ pub(crate) fn add_hooks_path_to_file(
     writeln!(file, "{}", path)?;
     Ok(())
 }
+/// The user-registered hook directories (`~/.grok/hooks-paths` lines) —
+/// exactly what `remove_hooks_path` can remove (same exact-string match).
+pub(crate) fn registered_hook_paths() -> std::collections::HashSet<String> {
+    let path = crate::util::grok_home::grok_home().join("hooks-paths");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
 /// Remove a hook path from `~/.grok/hooks-paths`.
 ///
-/// If the path is not found (exact string match), this is a no-op.
-/// Matches the same exact-string behavior as `add_hooks_path`.
-pub(crate) fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Returns whether the path was present (exact string match, like `add_hooks_path`).
+/// On `false` nothing was removed and callers must not claim success.
+pub(crate) fn remove_hooks_path(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
     remove_hooks_path_from_file(
         path,
         &crate::util::grok_home::grok_home().join("hooks-paths"),
@@ -2003,10 +2002,10 @@ pub(crate) fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Er
 pub(crate) fn remove_hooks_path_from_file(
     path: &str,
     paths_file: &std::path::Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let content = match std::fs::read_to_string(paths_file) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e.into()),
     };
     let mut found = false;
@@ -2022,7 +2021,7 @@ pub(crate) fn remove_hooks_path_from_file(
         })
         .collect();
     if !found {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(parent) = paths_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2031,7 +2030,7 @@ pub(crate) fn remove_hooks_path_from_file(
         paths_file,
         new_lines.join("\n") + (if new_lines.is_empty() { "" } else { "\n" }),
     )?;
-    Ok(())
+    Ok(true)
 }
 #[cfg(test)]
 mod tests;

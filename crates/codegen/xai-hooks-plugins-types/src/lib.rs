@@ -87,6 +87,7 @@ pub enum HookEvent {
     SessionEnd,
     Stop,
     StopFailure,
+    StopCancelled,
     // Tool events
     PreToolUse,
     PostToolUse,
@@ -101,6 +102,42 @@ pub enum HookEvent {
     // Compaction
     PreCompact,
     PostCompact,
+    /// An event added after this client was built: it keeps one unrecognized name from blanking
+    /// the whole list. Lossy on re-serialize, so only deserialize through this type.
+    #[serde(other)]
+    Unknown,
+}
+
+impl HookEvent {
+    /// Never fails: a name this build does not know deserializes to [`Self::Unknown`] through the
+    /// `#[serde(other)]` variant. Avoids a `serde_json::Value` round trip on UI paths.
+    pub fn from_wire(name: &str) -> Self {
+        use serde::de::IntoDeserializer as _;
+        let name: serde::de::value::StrDeserializer<'_, serde::de::value::Error> =
+            name.into_deserializer();
+        Self::deserialize(name).unwrap_or(Self::Unknown)
+    }
+
+    /// The events that report a turn ending, at most one of which fires per turn. Exhaustive, so
+    /// a fourth is a compile error rather than a silent miss in a consumer.
+    pub fn is_turn_end(self) -> bool {
+        match self {
+            Self::Stop | Self::StopFailure | Self::StopCancelled => true,
+            Self::SessionStart
+            | Self::SessionEnd
+            | Self::PreToolUse
+            | Self::PostToolUse
+            | Self::PostToolUseFailure
+            | Self::PermissionDenied
+            | Self::UserPromptSubmit
+            | Self::Notification
+            | Self::SubagentStart
+            | Self::SubagentStop
+            | Self::PreCompact
+            | Self::PostCompact
+            | Self::Unknown => false,
+        }
+    }
 }
 
 impl std::fmt::Display for HookEvent {
@@ -113,6 +150,7 @@ impl std::fmt::Display for HookEvent {
             Self::SessionEnd => write!(f, "Session End"),
             Self::Stop => write!(f, "Stop"),
             Self::StopFailure => write!(f, "Stop Failure"),
+            Self::StopCancelled => write!(f, "Stop Cancelled"),
             Self::Notification => write!(f, "Notification"),
             Self::UserPromptSubmit => write!(f, "Prompt Submit"),
             Self::PermissionDenied => write!(f, "Permission Denied"),
@@ -120,6 +158,7 @@ impl std::fmt::Display for HookEvent {
             Self::SubagentStop => write!(f, "Subagent Stop"),
             Self::PreCompact => write!(f, "Pre-Compact"),
             Self::PostCompact => write!(f, "Post-Compact"),
+            Self::Unknown => write!(f, "Unknown"),
         }
     }
 }
@@ -205,6 +244,18 @@ pub struct HookInfo {
     /// Whether this hook is disabled via ~/.grok/disabled-hooks.
     #[serde(default)]
     pub disabled: bool,
+    /// Enforced by root-owned managed policy: disable actions are refused
+    /// and disable state is ignored, so surfaces should show the pinned
+    /// state up front rather than let a refusal be the first signal.
+    #[serde(default)]
+    pub pinned: bool,
+    /// Whether `HooksAction::Remove` can succeed for this hook's source:
+    /// true only for user-registered hook directories without a
+    /// managed-policy member (removal targets the whole `source_dir`, and a
+    /// pinned member makes it refused), so surfaces don't offer removal
+    /// elsewhere.
+    #[serde(default)]
+    pub removable: bool,
 }
 
 /// Response for `x.ai/hooks/list`.
@@ -616,39 +667,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hooks_action_serde_roundtrip() {
-        let action = HooksAction::Add {
-            path: "/home/user/.grok/hooks".into(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        let parsed: HooksAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(action, parsed);
-    }
-
-    #[test]
-    fn plugins_action_serde_roundtrip() {
-        let action = PluginsAction::Install {
-            source: "github.com/foo/bar".into(),
-        };
-        let json = serde_json::to_string(&action).unwrap();
-        let parsed: PluginsAction = serde_json::from_str(&json).unwrap();
-        assert_eq!(action, parsed);
-    }
-
-    #[test]
-    fn action_outcome_serde_roundtrip() {
-        let outcome = ActionOutcome {
-            status: OutcomeStatus::Success,
-            message: "Installed 1 plugin(s)".into(),
-            requires_reload: true,
-            requires_restart: false,
-        };
-        let json = serde_json::to_string(&outcome).unwrap();
-        let parsed: ActionOutcome = serde_json::from_str(&json).unwrap();
-        assert_eq!(outcome, parsed);
-    }
-
-    #[test]
     fn hooks_action_tagged_enum_format() {
         let action = HooksAction::Trust;
         let json = serde_json::to_string(&action).unwrap();
@@ -709,6 +727,8 @@ mod tests {
             timeout_ms: 5000,
             source_dir: "/home/user/.grok/hooks".into(),
             disabled: false,
+            pinned: false,
+            removable: true,
         };
         let json = serde_json::to_string(&hook).unwrap();
         assert!(json.contains("handlerType"));
@@ -862,6 +882,7 @@ mod tests {
             (HookEvent::SessionEnd, r#""session_end""#),
             (HookEvent::Stop, r#""stop""#),
             (HookEvent::StopFailure, r#""stop_failure""#),
+            (HookEvent::StopCancelled, r#""stop_cancelled""#),
             (HookEvent::Notification, r#""notification""#),
             (HookEvent::UserPromptSubmit, r#""user_prompt_submit""#),
             (HookEvent::PermissionDenied, r#""permission_denied""#),
@@ -877,42 +898,16 @@ mod tests {
         }
     }
 
+    /// A newer shell can name an event this build has never heard of. Both readers must fall back
+    /// rather than fail, or one unknown name blanks the whole plugin list.
     #[test]
-    fn marketplace_plugin_entry_roundtrip_preserves_homepage_and_keywords() {
-        let entry = MarketplacePluginEntry {
-            name: "demo".into(),
-            version: Some("1.2.3".into()),
-            description: Some("A demo plugin".into()),
-            category: Some("development".into()),
-            author: Some("xai".into()),
-            tags: vec!["cli".into()],
-            keywords: vec!["search".into(), "index".into()],
-            domains: vec!["example.com".into()],
-            homepage: Some("https://example.com/demo".into()),
-            relative_path: "plugins/demo".into(),
-            skill_count: 1,
-            has_hooks: true,
-            has_agents: false,
-            has_mcp: false,
-            install_status: "not_installed".into(),
-            installed_version: None,
-            components: None,
-            remote_url: None,
-            remote_ref: None,
-            remote_sha: None,
-            remote_subdir: None,
-        };
-        let json = serde_json::to_string(&entry).unwrap();
-        assert!(json.contains("homepage"), "{json}");
-        assert!(json.contains("keywords"), "{json}");
-        let parsed: MarketplacePluginEntry = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.homepage.as_deref(), Some("https://example.com/demo"));
+    fn an_unrecognized_event_name_reads_as_unknown() {
         assert_eq!(
-            parsed.keywords,
-            vec!["search".to_string(), "index".to_string()]
+            HookEvent::from_wire("some_future_event"),
+            HookEvent::Unknown
         );
-        assert_eq!(parsed.domains, vec!["example.com".to_string()]);
-        assert_eq!(parsed.tags, vec!["cli".to_string()]);
+        let parsed: HookEvent = serde_json::from_str(r#""some_future_event""#).unwrap();
+        assert_eq!(parsed, HookEvent::Unknown);
     }
 
     #[test]

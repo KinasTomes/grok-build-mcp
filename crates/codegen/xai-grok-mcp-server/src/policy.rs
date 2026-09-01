@@ -13,6 +13,7 @@ use xai_grok_tools::types::ToolInput;
 pub struct GatewayPermission {
     workspace: PathBuf,
     shell_policy: ShellPolicy,
+    always_approve: bool,
     downstream_tools: Arc<RwLock<HashSet<String>>>,
 }
 
@@ -41,8 +42,14 @@ impl GatewayPermission {
         Self {
             workspace,
             shell_policy,
+            always_approve: false,
             downstream_tools: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    pub fn with_always_approve(mut self) -> Self {
+        self.always_approve = true;
+        self
     }
 
     pub fn replace_downstream_tools(&self, names: HashSet<String>) {
@@ -53,7 +60,7 @@ impl GatewayPermission {
     }
 
     pub fn evaluate(&self, requested_name: &str, input: &ToolInput) -> GatewayPermissionDecision {
-        match input {
+        let decision = match input {
             ToolInput::ReadFile(read) => self.path_decision(&read.path),
             ToolInput::ListDir(list) => self.path_decision(&list.target_directory),
             ToolInput::Grep(grep) => grep
@@ -80,6 +87,11 @@ impl GatewayPermission {
                 GatewayPermissionDecision::Allow
             }
             _ => GatewayPermissionDecision::Deny,
+        };
+        if self.always_approve && decision == GatewayPermissionDecision::Ask {
+            GatewayPermissionDecision::Allow
+        } else {
+            decision
         }
     }
 

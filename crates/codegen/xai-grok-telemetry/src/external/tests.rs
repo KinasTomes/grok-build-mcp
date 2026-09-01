@@ -1,8 +1,6 @@
-//! Unit tests for the external stream: pinned allowlists, per-event schema
-//! snapshots, canary leak tests, gate enforcement, and the tighten-only
-//! remote policy. Everything asserting wire shape goes through the
-//! in-memory exporters *behind the export-time validators*, so the tests pin
-//! what actually leaves the process.
+//! External-stream tests: pinned allowlists, per-event schema snapshots, canary leak tests, gate enforcement, and the tighten-only remote policy.
+//! Everything asserting wire shape goes through the in-memory exporters *behind the export-time validators*.
+//! The tests therefore pin what actually leaves the process.
 
 use super::config::ContentGates;
 use super::schema::{self, AttrValue, ExternalKey, ExternalRecord, MetricIncrement};
@@ -81,10 +79,9 @@ fn exported_metric_names(stream: &TestStream) -> Vec<String> {
 
 #[test]
 fn external_allowed_keys_are_pinned() {
-    // Keep this an independent copy — don't reference ALL_KEYS or
-    // ExternalKey::as_str, or the assert becomes a tautology and stops gating
-    // schema changes. Adding a key exports a new field: confirm it carries no
-    // user content, then update this pin.
+    // Keep this an independent copy, not a reference to ALL_KEYS or ExternalKey::as_str
+    // Deriving it would make the assert a tautology that stops gating schema changes
+    // Adding a key exports a new field: confirm it carries no user content, then update this pin
     let expected: &[&str] = &[
         "session.id",
         "turn_number",
@@ -119,9 +116,12 @@ fn external_allowed_keys_are_pinned() {
         "output_tokens",
         "reasoning_tokens",
         "cache_read_tokens",
+        "cache_creation_tokens",
+        "cost_usd_micros",
         "status_code",
         "tool_name",
         "success",
+        "hook_rewrote",
         "file_extension",
         "tool_parameters",
         "file_path",
@@ -273,6 +273,12 @@ fn screen_mode_allowlist_is_pinned() {
 #[test]
 fn tool_name_sanitization() {
     assert_eq!(schema::sanitize_tool_name("read_file"), "read_file");
+    assert_eq!(schema::sanitize_tool_name("memory_search"), "memory_search");
+    assert_eq!(schema::sanitize_tool_name("memory_get"), "memory_get");
+    assert_eq!(
+        schema::sanitize_tool_name("send_subagent_message"),
+        "send_subagent_message"
+    );
     assert_eq!(
         schema::sanitize_tool_name("nebula__post_message"),
         "mcp_tool"
@@ -317,6 +323,7 @@ fn sentinel_session_harness() -> events::SessionHarness {
         hook_names: vec!["h1".into()],
         agents_md_dir_names: vec!["proj".into()],
         memory_enabled: true,
+        memory_retrieval_mode: events::MemoryRetrievalMode::Hybrid,
         is_git_repo: true,
         auto_update: None,
     }
@@ -378,7 +385,7 @@ fn session_new_increments_session_count_only() {
 fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
     let stream = build(gates_off());
     let mut phase_durations_ms = std::collections::BTreeMap::new();
-    phase_durations_ms.insert("load_config".into(), 12);
+    phase_durations_ms.insert("config_load".into(), 12);
     phase_durations_ms.insert("model_catalog".into(), 28_700);
     emit_event_into(
         &stream,
@@ -386,7 +393,7 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
             connect_target: crate::startup::AgentKind::Embedded,
             outcome: crate::startup::StartupOutcome::Timeout,
             stuck_in: Some("model_catalog".into()),
-            phases: "load_config=12ms, model_catalog>=28.7s".into(),
+            phases: "config_load=12ms, model_catalog>=28.7s".into(),
             phase_durations_ms,
             elapsed_ms: 30_000,
             timeout_secs: Some(30),
@@ -407,15 +414,21 @@ fn agent_connect_timeout_emits_phase_histogram_and_timeout_counter() {
 }
 
 #[test]
-fn startup_complete_records_the_total_histogram_only() {
+fn startup_completed_records_the_total_histogram_only() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
-        &events::StartupComplete {
+        &events::StartupCompleted {
             total_ms: 1_234,
             outcome: crate::startup::StartupOutcome::Ok,
-            phases: "load_config=12ms, session_create=800ms".into(),
+            phases: "config_load=12ms, session_create=800ms".into(),
             auth_mode: crate::startup::AuthMode::Team,
+            prefetch_wait_ms: Some(210),
+            session_load_ms: Some(120),
+            session_replay_ms: None,
+            session_git_scan_ms: Some(40),
+            session_spawn_ms: Some(300),
+            time_to_first_frame_ms: Some(650),
         },
     );
     assert!(exported_events(&stream).is_empty());
@@ -438,6 +451,8 @@ fn api_request_snapshot_and_token_usage() {
             completion_tokens: Some(50),
             reasoning_tokens: Some(25),
             cached_prompt_tokens: None,
+            cache_creation_tokens: None,
+            cost_usd_ticks: None,
         },
     );
     let events = exported_events(&stream);
@@ -453,11 +468,41 @@ fn api_request_snapshot_and_token_usage() {
     );
 }
 
-/// One failed turn ⇒ exactly one `error.count` increment, even though the
-/// failure emits `ApiError` (and possibly `RateLimitHit`) *alongside*
-/// `TurnCompleted{Error}`. `TurnCompleted{Error}` is the single increment
-/// source; the api_error log events carry no metric (Bugbot regression:
-/// double-counted errors at customer collectors).
+#[test]
+fn api_request_cost_and_cache_creation_export_attrs_and_metrics() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::ModelResponseReceived {
+            model_id: "grok-4".into(),
+            duration_ms: 1200,
+            stop_reason: Some("stop".into()),
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            reasoning_tokens: None,
+            cached_prompt_tokens: None,
+            cache_creation_tokens: Some(40),
+            // 5e9 ticks is $0.50, which exports as 500_000 micros
+            cost_usd_ticks: Some(5_000_000_000),
+        },
+    );
+    let ev = &exported_events(&stream)[0];
+    assert_eq!(ev.0, "grok_code.api_request");
+    assert_eq!(attr(ev, "cache_creation_tokens").as_deref(), Some("40"));
+    assert_eq!(attr(ev, "cost_usd_micros").as_deref(), Some("500000"));
+    let mut names = exported_metric_names(&stream);
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["grok_code.cost.usage", "grok_code.token.usage"],
+        "cost increments cost.usage; cache_creation rides token.usage"
+    );
+}
+
+/// One failed turn increments `error.count` exactly once.
+/// The failure emits `ApiError` (and possibly `RateLimitHit`) alongside `TurnCompleted{Error}`.
+/// `TurnCompleted{Error}` is the single increment source; the api_error log events carry no metric.
+/// A regression here once double-counted errors at customer collectors.
 #[test]
 fn one_failed_turn_increments_error_count_exactly_once() {
     let stream = build(gates_off());
@@ -489,7 +534,7 @@ fn one_failed_turn_increments_error_count_exactly_once() {
             error_category: Some("rate_limit".into()),
         },
     );
-    // Both api_error events exported as log records…
+    // Both api_error events are exported as log records
     let names: Vec<String> = exported_events(&stream)
         .iter()
         .map(|e| e.0.clone())
@@ -498,7 +543,7 @@ fn one_failed_turn_increments_error_count_exactly_once() {
         names.iter().filter(|n| *n == "grok_code.api_error").count(),
         2
     );
-    // …but error.count incremented exactly once.
+    // error.count is incremented exactly once
     let total: u64 = stream
         .metrics
         .get_finished_metrics()
@@ -537,14 +582,38 @@ fn turn_error_increments_error_count() {
 }
 
 #[test]
+fn tool_result_hook_rewrote_is_content_free() {
+    use xai_grok_session_events::types::ToolOutcome;
+    for (hook_rewrote, want) in [(true, "true"), (false, "false")] {
+        let stream = build(gates_off());
+        emit_event_into(
+            &stream,
+            &events::ToolCallCompleted {
+                tool_name: "run_terminal_cmd".into(),
+                outcome: ToolOutcome::Success,
+                hook_rewrote,
+                duration_ms: 5,
+                tool_result_size_bytes: None,
+                file_path: None,
+                parameters: None,
+            },
+        );
+        let events = exported_events(&stream);
+        assert_eq!(attr(&events[0], "hook_rewrote").as_deref(), Some(want));
+    }
+}
+
+#[test]
 fn tool_result_gates_off_collapses_and_reduces() {
     let stream = build(gates_off());
     emit_event_into(
         &stream,
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
-            outcome: xai_file_utils::events::types::ToolOutcome::Success,
+            outcome: xai_grok_session_events::types::ToolOutcome::Success,
+            hook_rewrote: false,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some("/Users/alice/secret-project/main.rs".into()),
             parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
         },
@@ -571,9 +640,8 @@ fn tool_result_gates_off_collapses_and_reduces() {
 #[test]
 fn tool_result_details_gate_exposes_verbatim_scrubbed() {
     let stream = build(gates_all_on());
-    // Use the *real* home dir: `redact_user_paths` collapses the current
-    // user's home (env-derived), not arbitrary foreign paths.
-    let home = dirs::home_dir()
+    // Use the *real* home dir: `redact_user_paths` collapses the current user's home (env-derived), not arbitrary foreign paths
+    let home = xai_dirs::home_dir()
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/home/testuser".into());
     let path = format!("{home}/proj/main.rs");
@@ -581,8 +649,10 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
         &stream,
         &events::ToolCallCompleted {
             tool_name: "nebula__post_message".into(),
-            outcome: xai_file_utils::events::types::ToolOutcome::Success,
+            outcome: xai_grok_session_events::types::ToolOutcome::Success,
+            hook_rewrote: false,
             duration_ms: 42,
+            tool_result_size_bytes: None,
             file_path: Some(path.clone()),
             parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
         },
@@ -635,9 +705,8 @@ fn user_prompt_gates_off_drops_text() {
     );
 }
 
-/// `screen_mode` is externally controlled free text (ACP `_meta.screenMode`);
-/// unknown values must collapse to `"other"` on the wire, and an absent value
-/// must emit no attribute at all.
+/// `screen_mode` is externally controlled free text (ACP `_meta.screenMode`).
+/// Unknown values must collapse to `"other"` on the wire, and an absent value must emit no attribute.
 #[test]
 fn user_prompt_screen_mode_sanitized_and_optional() {
     let stream = build(gates_off());
@@ -711,6 +780,42 @@ fn mcp_connection_collapses_server_name_by_default() {
 }
 
 #[test]
+fn agent_message_tool_decision_identity() {
+    let stream = build(gates_off());
+    emit_event_into(
+        &stream,
+        &events::PermissionDecisionPayload {
+            tool_name: "send_subagent_message".into(),
+            access_kind: events::AccessKind::AgentMessage,
+            decision: events::PermissionOutcome::Allow,
+            wait_ms: 10,
+            permission_mode: crate::enums::PermissionMode::Ask,
+            source: Some("allowed".into()),
+            subagent_session_id: None,
+            subagent_type: None,
+            manager_prompt_attempted: Some(true),
+            prompt_outcome: Some(events::PermissionPromptOutcome::Allow),
+            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::AllowOnce),
+            remember_tool_approvals: Some(true),
+            decision_reason: Some(events::PermissionDecisionReason::NeedsUser),
+            classifier_source: None,
+            classifier_verdict: None,
+            security_findings: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+        },
+    );
+    let events = exported_events(&stream);
+    let ev = &events[0];
+    assert_eq!(
+        attr(ev, "tool_name").as_deref(),
+        Some("send_subagent_message")
+    );
+    assert_eq!(attr(ev, "access_kind").as_deref(), Some("agent_message"));
+}
+
+#[test]
 fn tool_decision_snapshot() {
     let stream = build(gates_off());
     emit_event_into(
@@ -726,6 +831,8 @@ fn tool_decision_snapshot() {
             subagent_type: None,
             manager_prompt_attempted: Some(true),
             prompt_outcome: Some(events::PermissionPromptOutcome::Reject),
+            prompt_outcome_detail: Some(events::PermissionPromptOutcomeDetail::RejectOnce),
+            remember_tool_approvals: Some(true),
             decision_reason: Some(events::PermissionDecisionReason::AutoDenialLimit),
             classifier_source: Some(events::PermissionClassifierSource::Llm),
             classifier_verdict: Some(events::PermissionClassifierVerdict::Block),
@@ -750,6 +857,8 @@ fn tool_decision_snapshot() {
     for key in [
         "manager_prompt_attempted",
         "prompt_outcome",
+        "prompt_outcome_detail",
+        "remember_tool_approvals",
         "decision_reason",
         "classifier_source",
         "classifier_verdict",
@@ -848,16 +957,14 @@ fn unmapped_events_produce_nothing() {
     assert!(ev.external_record().is_none());
 }
 
-/// Workspace-origin exclusion: events emitted exclusively via
-/// `EmitterOrigin::Workspace` (`log_session_event_with_origin`) must not carry
-/// an external mapping — the fan-out hook deliberately lives only in the
-/// Shell-origin wrappers. The workspace-only surface today is the
-/// xai-grok-workspace sampler events, which live outside this crate and have
-/// no `telemetry_event!` binding here; this pin guards the in-crate set.
+/// Events emitted exclusively via `EmitterOrigin::Workspace` (`log_session_event_with_origin`) must not carry an external mapping.
+/// The fan-out hook deliberately lives only in the Shell-origin wrappers.
+/// The workspace-only events today are the xai-grok-workspace sampler events.
+/// Those live outside this crate with no `telemetry_event!` binding here; this pin guards the in-crate set.
 #[test]
 fn workspace_only_events_have_no_external_mapping() {
     use crate::events::TelemetryEvent as _;
-    // Trace-upload lifecycle events are session-metrics/internal-only.
+    // Trace-upload events stay in internal session metrics
     assert!(
         crate::session_metrics::TraceUploadAttempted {
             session_id: String::new(),
@@ -974,8 +1081,7 @@ fn validating_metric_exporter_drops_export_on_bad_attr_key() {
 
 #[test]
 fn redacting_log_exporter_drops_record_with_closed_gate_key() {
-    // A bug that attaches a gated key with the gate off must be caught at the
-    // exporter even though emit.rs should never produce it.
+    // A bug that attaches a gated key with the gate off must be caught at the exporter even though emit.rs should never produce it
     let stream = build(gates_off());
     use opentelemetry::logs::{LogRecord as _, Logger as _};
     let logger = stream.ext.logger.as_ref().unwrap();
@@ -1051,8 +1157,7 @@ async fn remote_gate_lock_forces_gates_off_and_never_on() {
         },
     );
     assert_eq!(*stream.ext.gates.read(), ContentGates::default());
-    // The policy carries no loosen/enable direction by construction: applying
-    // a default policy to an off-gates stream changes nothing.
+    // The policy carries no loosen/enable direction by construction: applying a default policy to an off-gates stream changes nothing
     let stream2 = build(gates_off());
     super::apply_remote_policy_on(&stream2.ext, super::ExternalOtelRemotePolicy::default());
     assert_eq!(*stream2.ext.gates.read(), ContentGates::default());
@@ -1094,7 +1199,7 @@ fn settings_gate_suppresses_until_resolved() {
         "is_active must be false while the settings gate is closed"
     );
 
-    // Settings response arrives (policy evaluated) → reopen.
+    // The settings response arrives (policy evaluated); the gate reopens
     super::mark_external_otel_settings_resolved();
     assert!(
         super::is_settings_gate_open(),

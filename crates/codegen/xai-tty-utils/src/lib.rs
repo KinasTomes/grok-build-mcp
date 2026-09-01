@@ -36,6 +36,19 @@
 //! cmd.envs(pager_env());
 //! ```
 
+// A panic on a teardown path leaks whatever it was about to free; tests panic freely.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 use std::collections::HashMap;
 use std::io;
 
@@ -43,7 +56,10 @@ mod child_wait;
 pub use child_wait::{is_child_wait_identity_uncertain, spawn_child_reaper, wait_child_bounded};
 
 mod process_resources;
-pub use process_resources::{ProcessResources, sample_process_memory, sample_process_resources};
+pub use process_resources::{
+    ProcessCpu, ProcessResources, process_memory_limit, process_start_time, sample_process_cpu,
+    sample_process_memory, sample_process_resources,
+};
 
 mod process_scope;
 pub use process_scope::{ProcessScope, global_process_scope};
@@ -132,6 +148,24 @@ pub fn reset_oom_score_adj() -> io::Result<()> {
 #[cfg(unix)]
 pub const RESET_CHILD_OOM_ENV: &str = "GROK_TOOLS_RESET_CHILD_OOM";
 
+/// Lower this process's `oom_score_adj` to -900 so the kernel OOM killer
+/// prefers any ordinary child (score 0) while the server remains a last-resort
+/// victim (unlike -1000, which would exempt it entirely and can leave a capped
+/// cgroup with no eligible victim at all). Lowering the score needs
+/// root/`CAP_SYS_RESOURCE`; the error distinguishes a real misconfiguration
+/// (`PermissionDenied`) from an expected non-procfs environment (`NotFound`).
+/// The score is inherited across `fork`, so a caller that gets `Ok` MUST arm
+/// [`RESET_CHILD_OOM_ENV`] or its whole subtree inherits the protection.
+#[cfg(target_os = "linux")]
+pub fn protect_from_oom_kill() -> io::Result<()> {
+    std::fs::write("/proc/self/oom_score_adj", "-900\n")
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn protect_from_oom_kill() -> io::Result<()> {
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
 #[cfg(unix)]
 pub fn detach_from_tty_reset_oom() -> io::Result<()> {
     reset_oom_score_adj()?;
@@ -172,6 +206,139 @@ pub fn detach_command(cmd: &mut tokio::process::Command) {
         use windows::Win32::System::Threading::CREATE_NO_WINDOW;
         cmd.creation_flags(CREATE_NO_WINDOW.0);
     }
+}
+
+/// Configure a short-lived search child ([`detach_command`], no stdin) that is
+/// killed and queued for reaping if its future is dropped (cancellation).
+pub fn detach_search_command(cmd: &mut tokio::process::Command) {
+    detach_command(cmd);
+    // `null_stdio`, not `Stdio::null()`: the latter opens `/dev/null` by path
+    // during spawn setup, so an unlinked device fails the spawn outright and
+    // takes out search for the rest of the process's life. See `null_stdio`.
+    cmd.stdin(null_stdio());
+    cmd.kill_on_drop(true);
+}
+
+// ---------------------------------------------------------------------------
+// Null stdio that outlives /dev/null
+// ---------------------------------------------------------------------------
+
+/// A null stdio handle for a child, taken from a descriptor opened once rather
+/// than from the `/dev/null` path.
+///
+/// Use this instead of [`std::process::Stdio::null`] on every spawn path, for
+/// stdin and for discarded stdout/stderr alike. `Stdio::null()` opens
+/// `/dev/null` *by path*, in the parent, during spawn setup — so if anything
+/// in the sandbox unlinks the device, `spawn` fails with `ENOENT` before
+/// fork/exec and **every** process-spawning tool dies for the rest of the
+/// process's life, while tools that only touch the filesystem keep working and
+/// make it look like a workspace fault. Nothing recreates the device, and
+/// recreating it would itself require spawning something. A root
+/// `go build -o /dev/null` whose build fails is enough to trigger it: Go
+/// removes its `-o` target on failure.
+///
+/// An already-open descriptor keeps working after its directory entry is gone,
+/// so this opens `/dev/null` once, read-write, and hands out dups.
+///
+/// A process that starts *after* the deletion has nothing to open and falls
+/// back to the read end of a pipe whose write end is already closed: reads see
+/// immediate EOF, as with `/dev/null`. That fallback is correct for stdin only
+/// — a child writing to it gets `EBADF` — but it is reachable solely once the
+/// device is already gone, where the alternative is not spawning at all. If
+/// even that fails it degrades to `Stdio::null()`, i.e. today's behaviour.
+#[cfg(unix)]
+pub fn null_stdio() -> std::process::Stdio {
+    use std::sync::OnceLock;
+
+    static NULL_FD: OnceLock<Option<std::os::fd::OwnedFd>> = OnceLock::new();
+
+    let cached = NULL_FD
+        .get_or_init(|| open_null_fd(std::path::Path::new("/dev/null")).or_else(eof_pipe_fd));
+    match cached {
+        // dup(2) per spawn: `Stdio` takes ownership, the cache keeps the original.
+        Some(fd) => fd
+            .try_clone()
+            .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from),
+        None => std::process::Stdio::null(),
+    }
+}
+
+/// Windows has no `/dev/null` path to lose; `Stdio::null()` is already a handle.
+#[cfg(windows)]
+pub fn null_stdio() -> std::process::Stdio {
+    std::process::Stdio::null()
+}
+
+/// Read-only descriptor for `path`, or `None` if it cannot be opened.
+///
+/// Split out so the "the descriptor outlives the path" property can be tested
+/// against an ordinary file, without a mount namespace or root.
+#[cfg(unix)]
+fn open_null_fd(path: &std::path::Path) -> Option<std::os::fd::OwnedFd> {
+    // Read AND write, because one cached descriptor serves both directions:
+    // stdin reads EOF from it, stdout/stderr discard into it. A read-only fd
+    // would look fine until a child wrote to it — `write` on `O_RDONLY` fails
+    // with `EBADF`, which turns a discarded diagnostic into a failed command
+    // (and, in a shell, spills the text onto stdout, corrupting captured
+    // output). This mirrors `Stdio::null()` itself, which opens `/dev/null`
+    // readable for stdin and writable for stdout/stderr.
+    //
+    // `OpenOptions` sets CLOEXEC, so the cached fd is not inherited wholesale.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .ok()
+        .map(Into::into)
+}
+
+/// Read end of a pipe whose write end is already closed — a reader sees EOF at
+/// once, which is what `/dev/null` gives a child's stdin.
+///
+/// The last resort for a process that came up with no `/dev/null` to cache.
+///
+/// Both ends are close-on-exec, atomically via `pipe2(O_CLOEXEC)` on Linux.
+/// That matters more here than for an ordinary pipe: a concurrent `fork`/`exec`
+/// landing between `pipe()` and `fcntl(F_SETFD)` could inherit the **write**
+/// end, and a child holding it open means no reader of the cached read end ever
+/// sees EOF — a child given it as stdin would block instead of starting
+/// cleanly. Since the descriptor is cached for the process's lifetime, that
+/// would be sticky, and a hang is a worse outcome than the `ENOENT` this
+/// fallback exists to avoid. Mirrors `os_pipe` in xai-grok-tools' shell_state,
+/// including the best-effort `fcntl` path where `pipe2` is unavailable.
+#[cfg(unix)]
+fn eof_pipe_fd() -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let mut fds = [0 as libc::c_int; 2];
+
+    // SAFETY: `fds` is a valid, writable two-element array for the call's duration.
+    #[cfg(target_os = "linux")]
+    let created = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    // SAFETY: same.
+    #[cfg(not(target_os = "linux"))]
+    let created = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if created != 0 {
+        return None;
+    }
+
+    // SAFETY: the pipe call reported success, so both descriptors are open and unowned.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+
+    // Non-Linux has no atomic form: close the window as fast as possible and
+    // accept it, as the sibling helper does.
+    #[cfg(not(target_os = "linux"))]
+    {
+        use std::os::fd::AsRawFd;
+        for fd in [read.as_raw_fd(), write.as_raw_fd()] {
+            // SAFETY: both descriptors are live and owned here.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+
+    // Closing the write end is what turns reads into an immediate EOF.
+    drop(write);
+    Some(read)
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +539,40 @@ pub async fn reap_killed_bounded(
     match tokio::time::timeout(bound, child.wait()).await {
         Ok(res) => res.ok(),
         Err(_elapsed) => None,
+    }
+}
+
+/// True when `pid` is gone or a zombie awaiting reap — i.e. no longer running.
+/// Test/assertion observation only — production liveness checks must use
+/// [`ProcessGroup::has_live_members`], which counts zombies as live.
+#[cfg(unix)]
+pub fn process_not_running(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Err(_) => true,
+            // State is the first field after the parenthesized comm.
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.trim_start().chars().next())
+                .is_some_and(|state| state == 'Z'),
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+        {
+            // Can't tell; report "running" so callers fail loudly.
+            Err(_) => false,
+            Ok(out) => {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                stat.is_empty() || stat.starts_with('Z')
+            }
+        }
     }
 }
 
@@ -598,6 +799,35 @@ impl ProcessGroup {
         #[cfg(windows)]
         {
             self.terminate_job(1)
+        }
+    }
+
+    /// Let the group's descendants outlive this handle's drop (Windows clears
+    /// kill-on-close; Unix drop never kills). Call on the success path.
+    pub fn preserve_descendants(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            use std::mem::{size_of, zeroed};
+            use windows::Win32::System::JobObjects::{
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+            // LimitFlags left at 0 (no kill-on-close), so the drop's `CloseHandle`
+            // no longer terminates the job's processes.
+            let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+            unsafe {
+                SetInformationJobObject(
+                    self.job,
+                    JobObjectExtendedLimitInformation,
+                    (&info as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .map_err(|e| io::Error::other(format!("SetInformationJobObject(preserve): {e}")))
         }
     }
 
@@ -952,18 +1182,66 @@ fn is_wsl_from_inputs(env: &HashMap<String, String>, osrelease: Option<&str>) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
 
+    /// Serializes process-global `/proc/self/oom_score_adj` mutation across tests.
+    #[cfg(target_os = "linux")]
+    static TEST_OOM_SCORE_ADJ_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Pins the mechanism every search-tool spawn site relies on: the child is
+    /// detached into its own process group and killed when its `Child` drops.
+    #[cfg(unix)]
     #[test]
-    fn detach_command_does_not_panic() {
-        let mut cmd = tokio::process::Command::new("echo");
-        detach_command(&mut cmd);
+    fn detach_search_command_kills_child_on_drop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let mut cmd = tokio::process::Command::new("/bin/sleep");
+            cmd.arg("30");
+            detach_search_command(&mut cmd);
+            #[allow(clippy::disallowed_methods)] // test child, killed on drop below
+            let child = cmd.spawn().expect("spawn sleep");
+            let pid = child.id().expect("child pid");
+
+            // The pre_exec setsid lands between fork and exec; poll until the
+            // child leaves our process group (pins the detach property).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(pid as i32)))
+                .expect("getpgid")
+                == nix::unistd::getpgrp()
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) stayed in our process group — not detached"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            drop(child);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !process_not_running(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep (pid {pid}) still running 5s after its Child was dropped — leaked"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
     }
 
     /// `None` when lowering our own score below 0 is not permitted (it needs
     /// `CAP_SYS_RESOURCE`).
     #[cfg(target_os = "linux")]
     fn child_oom_score_under(hook: fn() -> io::Result<()>) -> Option<String> {
+        // Hold for the full lower/spawn/restore window so parallel cargo test
+        // cannot interleave sibling score mutations (same pattern as workspace-daemon).
+        let _score_guard = TEST_OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
         let restore = own.trim().to_owned();
         if std::fs::write("/proc/self/oom_score_adj", b"-500\n").is_err() {
@@ -987,6 +1265,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn detach_from_tty_reset_oom_resets_the_child() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_from_tty_reset_oom) else {
             return;
         };
@@ -999,6 +1280,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn plain_detach_from_tty_leaves_child_oom_score_inherited() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_from_tty) else {
             return;
         };
@@ -1008,9 +1292,19 @@ mod tests {
         );
     }
 
+    /// Serializes every test that touches the process-global OOM state:
+    /// [`RESET_CHILD_OOM_ENV`] and `/proc/self/oom_score_adj` (mutated by both
+    /// [`child_oom_score_under`] and `protect_from_oom_kill`). Under parallel
+    /// `cargo test` these must not interleave.
+    #[cfg(target_os = "linux")]
+    static OOM_SCORE_ADJ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(target_os = "linux")]
     #[test]
     fn detach_pre_exec_hook_defaults_to_no_reset() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(score) = child_oom_score_under(detach_pre_exec_hook()) else {
             return;
         };
@@ -1020,10 +1314,45 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn detach_std_command_does_not_panic() {
-        let mut cmd = std::process::Command::new("echo");
-        detach_std_command(&mut cmd);
+    fn detach_pre_exec_hook_selects_reset_when_env_armed() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: test-process env mutation, serialized with the sibling test
+        // by the lock above; the var is removed before returning.
+        unsafe { std::env::set_var(RESET_CHILD_OOM_ENV, "1") };
+        let hook = detach_pre_exec_hook();
+        unsafe { std::env::remove_var(RESET_CHILD_OOM_ENV) };
+        let Some(score) = child_oom_score_under(hook) else {
+            return;
+        };
+        assert_eq!(
+            score, "0",
+            "with the env armed the hook must reset the child's oom_score_adj"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn protect_from_oom_kill_lowers_own_score_when_privileged() {
+        let _env = OOM_SCORE_ADJ_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let own = std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+        let restore = own.trim().to_owned();
+        // Unprivileged (no CAP_SYS_RESOURCE) must surface as an error, never
+        // a silent no-op.
+        match protect_from_oom_kill() {
+            Ok(()) => {
+                let score =
+                    std::fs::read_to_string("/proc/self/oom_score_adj").expect("read own score");
+                assert_eq!("-900", score.trim());
+                let _ = std::fs::write("/proc/self/oom_score_adj", format!("{restore}\n"));
+            }
+            Err(e) => assert_eq!(io::ErrorKind::PermissionDenied, e.kind()),
+        }
     }
 
     #[test]
@@ -1049,18 +1378,6 @@ mod tests {
         let lock_envs: HashMap<_, _> = locking.get_envs().collect();
         let read_envs: HashMap<_, _> = reading.get_envs().collect();
         assert_eq!(lock_envs, read_envs);
-    }
-
-    #[test]
-    fn new_process_group_does_not_panic() {
-        let mut cmd = tokio::process::Command::new("echo");
-        new_process_group(&mut cmd);
-    }
-
-    #[test]
-    fn kill_on_parent_death_std_does_not_panic() {
-        let mut cmd = std::process::Command::new("echo");
-        kill_on_parent_death_std(&mut cmd);
     }
 
     #[cfg(unix)]
@@ -1374,26 +1691,6 @@ mod tests {
         f.write_all(b"").expect("zero-length write should succeed");
     }
 
-    /// The `File` returned by `dup_tui_stderr` can write multi-byte UTF-8
-    /// without truncation or byte-level corruption.
-    ///
-    /// On Windows, a `File` wrapping a console handle uses `WriteFile`
-    /// (byte-oriented, code-page-dependent) instead of `WriteConsoleW`
-    /// (UTF-16, code-page-independent). This test verifies the bytes are
-    /// at least accepted without error. Full Unicode correctness on Windows
-    /// additionally requires `SetConsoleOutputCP(65001)` or using
-    /// `std::io::stderr()` (which routes through `WriteConsoleW`).
-    #[test]
-    fn dup_tui_stderr_accepts_multibyte_utf8() {
-        use std::io::Write;
-        let mut f = dup_tui_stderr().expect("dup_tui_stderr should succeed");
-        // Braille (3 bytes each), Powerline icon (3 bytes), emoji (4 bytes).
-        let payload = "⣀⣾⠿⠛\u{e0a0}\u{1F600}";
-        f.write_all(payload.as_bytes())
-            .expect("multi-byte UTF-8 write should succeed");
-        f.flush().expect("flush should succeed");
-    }
-
     /// Spawn a subprocess that exercises redirect → dup → restore.
     #[cfg(unix)]
     #[test]
@@ -1547,6 +1844,97 @@ mod tests {
             "killpg must reap the WHOLE group incl. the grandchild (tree-kill), not just the \
              leader; grandchild pid {gc_pid} still alive after group kill"
         );
+    }
+
+    /// The whole point of the cached descriptor: it keeps working after the
+    /// path it came from is unlinked, which is what `Stdio::null()` cannot do.
+    /// An ordinary file stands in for `/dev/null` so this needs no privileges.
+    #[cfg(unix)]
+    #[test]
+    fn null_fd_outlives_its_path() {
+        let path = std::env::temp_dir().join(format!("xai-tty-utils-null-{}", std::process::id()));
+        std::fs::write(&path, b"").expect("create stand-in null");
+        let fd = open_null_fd(&path).expect("open stand-in null");
+        std::fs::remove_file(&path).expect("unlink stand-in null");
+
+        assert!(
+            std::fs::File::open(&path).is_err(),
+            "the path must be gone, or the test proves nothing"
+        );
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(std::process::Stdio::from(fd.try_clone().expect("dup")))
+            .status()
+            .expect("spawn with a descriptor whose path was unlinked must still work");
+        assert!(status.success());
+    }
+
+    /// The fallback descriptor must be close-on-exec, or a concurrently
+    /// spawned child inherits the pipe and the cached read end never reaches
+    /// EOF — a hang, and a sticky one, since the fd is cached for the process's
+    /// lifetime. Also checks it reads EOF, which is the point of the fallback.
+    #[cfg(unix)]
+    #[test]
+    fn eof_pipe_fd_is_cloexec_and_reads_eof() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let fd = eof_pipe_fd().expect("pipe fallback");
+        // SAFETY: `fd` is a live descriptor owned by this test.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the cached fallback fd must be close-on-exec"
+        );
+
+        let mut buf = [0u8; 1];
+        let read = std::fs::File::from(fd).read(&mut buf).expect("read");
+        assert_eq!(read, 0, "the write end is closed, so reads must see EOF");
+    }
+
+    /// One cached descriptor serves both directions, so a child must be able
+    /// to WRITE to it as well as read EOF from it.
+    ///
+    /// A read-only fd passes every stdin test and then fails here: `write` on
+    /// `O_RDONLY` returns `EBADF`, so a discarded diagnostic becomes a failed
+    /// command — and a shell spills the text onto stdout, corrupting output
+    /// that callers parse.
+    #[cfg(unix)]
+    #[test]
+    fn null_stdio_accepts_child_writes() {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo diagnostic >&2; echo rc=$?"])
+            .stdin(null_stdio())
+            .stderr(null_stdio())
+            .output()
+            .expect("spawn");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("rc=0"),
+            "writing to a nulled stderr must succeed, got {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("diagnostic"),
+            "stderr text must be discarded, not spilled onto stdout: {stdout:?}"
+        );
+    }
+
+    /// Every spawn takes its own dup, so the helper must survive repeated use
+    /// and give the child an immediate EOF (as `/dev/null` does).
+    #[cfg(unix)]
+    #[test]
+    fn null_stdio_reads_eof_every_time() {
+        for i in 0..3 {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", "cat"])
+                .stdin(null_stdio())
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("spawn");
+            assert!(status.success(), "spawn {i} must succeed and see EOF");
+        }
     }
 
     /// [`ProcessGroupId`] rejects degenerate pids (0, 1, own group) at

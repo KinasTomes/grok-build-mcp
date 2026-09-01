@@ -104,6 +104,7 @@ pub fn conversation_to_row(c: Conversation, reg: &FacetRegistry) -> UnifiedRow {
         git_remotes: Vec::new(),
         source_workspace_dir: None,
         last_turn_summary: None,
+        last_recap: None,
         session_kind: None,
     };
     UnifiedRow {
@@ -151,8 +152,7 @@ pub struct SessionInfo {
     pub meta: RowMeta,
 }
 
-/// The ACP schema types `cwd` as an absolute path, so a row without one has no
-/// representation there.
+/// The ACP schema types `cwd` as an absolute path, so a row without one has no representation there.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CwdNotAbsolute;
 

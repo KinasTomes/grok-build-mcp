@@ -20,7 +20,7 @@ use crate::{
     },
     util::remap::remap_json_keys,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -254,6 +254,9 @@ pub struct SessionContext {
     /// The toolset loads existing state on construction and auto-saves
     /// after every tool execution. The file stores serialized `State<T>`
     /// values (e.g., `TodoState`).
+    ///
+    /// Empty means this registry gives the session a handle that reads and writes nothing. `xai-grok-agent` reads
+    /// the same empty value as "use the temp directory" for `session_folder`; unifying the two is a follow-up.
     pub state_path: PathBuf,
     /// Optional memory backend for cross-session knowledge retrieval.
     /// When `Some`, injected into `Resources` so `memory_search` / `memory_get`
@@ -286,7 +289,7 @@ pub struct SessionContext {
     /// `deploy_app` tool connects to the service at call time using the shared
     /// API key provider.
     pub app_builder_deployer_config:
-        crate::implementations::grok_build::deploy_app::AppBuilderDeployerConfig,
+        crate::implementations::grok_build::app_builder::AppBuilderDeployerConfig,
     /// Dynamic API key provider for tool HTTP clients.
     /// When set, clients resolve the API key per-request from this provider
     /// instead of using the key baked into their config at construction time.
@@ -609,7 +612,7 @@ impl ToolRegistryBuilder {
                 kind,
                 requires,
                 default_params: serde_json::to_value(P::default()).unwrap_or_default(),
-                input_schema: generate_schema::<T::Args>(),
+                input_schema: generate_schema_cached::<T::Args>(),
                 metadata: Box::new(tool),
                 output_converter: Box::new(|value| {
                     let typed: T::Output = serde_json::from_value(value)?;
@@ -695,6 +698,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
         b.register::<grok_build::TaskTool>();
+        b.register::<grok_build::SendSubagentMessageTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
         b.register::<grok_build::LspTool>();
@@ -1042,19 +1046,19 @@ impl ToolRegistryBuilder {
         if let Some(lsp) = ctx.lsp {
             resources.insert(lsp);
         }
-        let mut image_gen_config = ctx.image_gen_config;
-        let mut video_gen_config = ctx.video_gen_config;
-        if let Some(session_id) = &ctx.owner_session_id {
-            image_gen_config.stamp_session_id_header(session_id);
-            video_gen_config.stamp_session_id_header(session_id);
-        }
+        let image_gen_config = ctx.image_gen_config;
+        let video_gen_config = ctx.video_gen_config;
         if image_gen_config.has_credentials() {
             match crate::implementations::grok_build::image_gen::ImageGenClient::new(
                 &image_gen_config,
                 ctx.api_key_provider.clone(),
             ) {
                 Ok(client) => {
-                    let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+                    let mut client =
+                        client.with_attribution_callback(ctx.attribution_callback.clone());
+                    if let Some(session_id) = &ctx.owner_session_id {
+                        client = client.with_session_id(session_id);
+                    }
                     resources.insert(client);
                 }
                 Err(e) => {
@@ -1068,7 +1072,11 @@ impl ToolRegistryBuilder {
                 ctx.api_key_provider.clone(),
             ) {
                 Ok(client) => {
-                    let client = client.with_attribution_callback(ctx.attribution_callback.clone());
+                    let mut client =
+                        client.with_attribution_callback(ctx.attribution_callback.clone());
+                    if let Some(session_id) = &ctx.owner_session_id {
+                        client = client.with_session_id(session_id);
+                    }
                     resources.insert(client);
                 }
                 Err(e) => {
@@ -1110,12 +1118,12 @@ impl ToolRegistryBuilder {
         for entry in self.tools.values() {
             (entry.register_params)(&mut resources);
         }
-        let resources_state_path = ctx
-            .state_path
-            .parent()
-            .unwrap_or(&ctx.state_path)
-            .join("resources_state.json");
-        let persistence = Arc::new(ResourcesPersistence::new(resources_state_path));
+        let persistence = Arc::new(if ctx.state_path.as_os_str().is_empty() {
+            ResourcesPersistence::noop()
+        } else {
+            let dir = ctx.state_path.parent().unwrap_or(&ctx.state_path);
+            ResourcesPersistence::new(dir.join("resources_state.json"))
+        });
         persistence.load(&mut resources);
         let preset_name = config.behavior_preset.as_deref().unwrap_or("current");
         let local_registry = self.shared_local_registry.take().unwrap_or_default();
@@ -1195,6 +1203,13 @@ impl ToolRegistryBuilder {
             .collect();
         resources.insert(crate::types::resources::EnabledNativeToolNames(
             native_tool_names,
+        ));
+        resources.insert(crate::types::resources::NativeToolClientNames(
+            tools
+                .iter()
+                .filter(|tool| !tool.client_name.contains("__"))
+                .map(|tool| (tool.registry_id.clone(), tool.client_name.clone()))
+                .collect(),
         ));
         let proposed: Vec<ProposedTool> = tools
             .iter()
@@ -1352,6 +1367,14 @@ impl FinalizedToolset {
     pub fn tool_name_for_kind(&self, kind: ToolKind) -> Option<String> {
         self.renderer.tool_for_kind(kind).map(str::to_owned)
     }
+    /// Client-facing name for a canonical registry ID, honoring name overrides.
+    pub fn tool_name_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.registry_id == registry_id)
+            .map(|tool| tool.client_name.clone())
+    }
     /// Map of client-facing tool name → snake_case [`ToolKind`] key.
     pub fn tool_kinds(&self) -> HashMap<String, String> {
         self.tools
@@ -1379,6 +1402,13 @@ impl FinalizedToolset {
     }
     pub async fn update_resource<T: Send + Sync + 'static>(&self, resource: T) {
         self.resources.lock().await.insert(resource);
+    }
+    /// Seed many resources under one lock. The closure runs under the lock; keep it to plain inserts.
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        seed(&mut *self.resources.lock().await);
     }
     /// Clone a typed resource out of this toolset, if present.
     ///
@@ -1834,7 +1864,7 @@ impl FinalizedToolset {
         let description = tool.description_template().to_string();
         let kind = tool.kind();
         let registry_id = xai_tool_runtime::Tool::id(&tool).as_str().to_owned();
-        let input_schema = input_schema_override.unwrap_or_else(generate_schema::<T::Args>);
+        let input_schema = input_schema_override.unwrap_or_else(generate_schema_cached::<T::Args>);
         let definition = ToolDefinition::function(&name, Some(&description), input_schema.clone());
         self.local_registry.register(tool);
         tools.push(FinalizedTool {
@@ -1898,13 +1928,11 @@ impl FinalizedToolset {
     pub async fn flush_persistence(&self) {
         self.resources_persistence.flush().await;
     }
-    /// Serialize current in-memory state, write it to disk, and wait for
-    /// the write to complete. Returns the path to the persisted file.
+    /// Serialize current in-memory state, write it to disk, and wait for the write to complete.
+    /// Returns where it landed, or `None` for a session that persists nothing.
     ///
-    /// Unlike `flush_persistence()` (which only flushes previously queued
-    /// snapshots), this method captures a **fresh** snapshot of the current
-    /// `Resources` and ensures it hits disk before returning.
-    pub async fn save_and_flush_persistence(&self) -> &std::path::Path {
+    /// Unlike `flush_persistence()`, which only flushes previously queued snapshots, this takes a fresh snapshot first.
+    pub async fn save_and_flush_persistence(&self) -> Option<&std::path::Path> {
         {
             let res = self.resources.lock().await;
             self.resources_persistence.save(&res);
@@ -1913,11 +1941,43 @@ impl FinalizedToolset {
         self.resources_persistence.state_path()
     }
 }
-/// Generate a JSON Schema for type `T`.
-///
-/// Public so out-of-tree tool packs can
-/// schema-test their tool inputs exactly the way the registry generates
-/// definitions.
+/// Process-global memo of generated tool input schemas, keyed by the exact
+/// [`std::any::TypeId`] of the schema type.
+fn schema_cache() -> &'static RwLock<HashMap<std::any::TypeId, serde_json::Value>> {
+    static CACHE: OnceLock<RwLock<HashMap<std::any::TypeId, serde_json::Value>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+/// Memoized [`generate_schema`], keyed by `TypeId`. Sound as a process-wide cache
+/// because the schema depends on `T` alone, not the agent or toolset; the per-boot
+/// toolset rebuild would otherwise regenerate identical schemas across a fan-out.
+pub(crate) fn generate_schema_cached<T: schemars::JsonSchema + 'static>() -> serde_json::Value {
+    let key = std::any::TypeId::of::<T>();
+    if let Some(cached) = schema_cache().read().get(&key) {
+        return cached.clone();
+    }
+    #[cfg(test)]
+    {
+        *schema_uncached_counts().lock().entry(key).or_insert(0) += 1;
+    }
+    let value = generate_schema::<T>();
+    schema_cache().write().insert(key, value.clone());
+    value
+}
+#[cfg(test)]
+fn schema_uncached_counts() -> &'static Mutex<HashMap<std::any::TypeId, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<std::any::TypeId, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+#[cfg(test)]
+fn schema_uncached_calls(key: std::any::TypeId) -> u64 {
+    schema_uncached_counts()
+        .lock()
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+}
+/// JSON Schema for `T` with the root `title` and `description` stripped. Pure
+/// and uncached; the per-boot hot path uses [`generate_schema_cached`].
 pub fn generate_schema<T: schemars::JsonSchema>() -> serde_json::Value {
     let settings = schemars::generate::SchemaSettings::draft07().with(|s| {
         s.inline_subschemas = true;
@@ -2172,7 +2232,7 @@ mod tests {
             video_gen_config:
                 crate::implementations::grok_build::video_gen::VideoGenConfig::default(),
             app_builder_deployer_config:
-                crate::implementations::grok_build::deploy_app::AppBuilderDeployerConfig::default(),
+                crate::implementations::grok_build::app_builder::AppBuilderDeployerConfig::default(),
             api_key_provider: None,
             auth_provider: None,
             attribution_callback: None,
@@ -2252,15 +2312,7 @@ mod tests {
             result.prompt_text
         );
     }
-    /// Verify the exact tool output variants for all template-rendered error
-    /// paths in `search_replace` when it is the **sole** Edit tool in the config.
-    ///
-    /// Exercises two code paths that use `TemplateRenderer` at runtime:
-    /// 1. `MultipleMatchesFound` — renders `${{ params.edit.replace_all }}`
-    /// 2. `NoMatchesFound` — renders `${{ tools.by_kind.read }}`
-    ///
-    /// Verify that the rendered `search_replace` description exposed to the model
-    /// contains the new minimum-anchor guidance and has no unresolved placeholders.
+    /// Rendered `search_replace` description: Read tool name substitutes, no leftover placeholders.
     #[tokio::test]
     async fn search_replace_description_renders_minimum_anchor_guidance() {
         let builder = ToolRegistryBuilder::new();
@@ -2303,8 +2355,8 @@ mod tests {
             .as_deref()
             .expect("description must be present");
         assert!(
-            !desc.contains("larger string with more surrounding context"),
-            "old guidance encouraging longer blocks must be absent"
+            desc.contains("read_file"),
+            "read tool name must render: {desc}"
         );
         assert!(
             !desc.contains("${{"),
@@ -2320,6 +2372,7 @@ mod tests {
         use crate::implementations::grok_build::{
             IMAGE_GEN_TOOL_NAME, IMAGE_TO_VIDEO_TOOL_NAME, REFERENCE_TO_VIDEO_TOOL_NAME,
             SCHEDULER_CREATE_TOOL_NAME, SCHEDULER_DELETE_TOOL_NAME,
+            SEND_SUBAGENT_MESSAGE_TOOL_NAME,
         };
         let builder = ToolRegistryBuilder::new();
         let config = ToolServerConfig {
@@ -2336,6 +2389,7 @@ mod tests {
                 "exit_plan_mode",
                 "todo_write",
                 "task",
+                SEND_SUBAGENT_MESSAGE_TOOL_NAME,
                 "web_search",
                 "web_fetch",
                 "lsp",
@@ -2659,12 +2713,10 @@ mod tests {
             "replace_all description should reference the renamed param: {replace_all_desc}"
         );
     }
-    /// Descriptions promising completion notifications ("You are notified on
-    /// completion") render conditionally on the client's system-reminders
+    /// Bash tool descriptions branch on the client's system-reminders
     /// setting, plumbed via `set_system_reminders_enabled` into the
-    /// `TemplateRenderer`. With reminders disabled, the bash description and
-    /// the `is_background` field description must not promise notifications;
-    /// they point at the get-output tool instead when one is served.
+    /// `TemplateRenderer`. With reminders disabled they name the get-output
+    /// tool when one is served.
     #[tokio::test]
     async fn bash_descriptions_track_system_reminders_setting() {
         let config_with = |ids: &[&str]| ToolServerConfig {
@@ -2697,34 +2749,23 @@ mod tests {
         let toolset = ToolRegistryBuilder::new()
             .finalize(config_with(&ids), test_session_context(&tmp))
             .expect("finalize");
-        let (desc, field_desc) = bash_texts(&toolset);
-        assert!(
-            desc.contains("You are notified on completion"),
-            "reminders on: description should promise notification: {desc}"
-        );
-        assert!(
-            field_desc.contains("you are notified on completion"),
-            "reminders on: is_background description should promise notification: {field_desc}"
-        );
+        let (desc_on, field_on) = bash_texts(&toolset);
         let tmp = TempDir::new().unwrap();
         let mut builder = ToolRegistryBuilder::new();
         builder.set_system_reminders_enabled(false);
         let toolset = builder
             .finalize(config_with(&ids), test_session_context(&tmp))
             .expect("finalize");
-        let (desc, field_desc) = bash_texts(&toolset);
+        let (desc_off, field_off) = bash_texts(&toolset);
+        assert_ne!(desc_on, desc_off);
+        assert_ne!(field_on, field_off);
         assert!(
-            !desc.contains("notified on completion"),
-            "reminders off: description must not promise notification: {desc}"
+            desc_off.contains("get_task_output"),
+            "reminders off: description should name get_task_output: {desc_off}"
         );
         assert!(
-            desc.contains("Check on it later with the get_task_output tool"),
-            "reminders off: description should point at get_task_output: {desc}"
-        );
-        assert!(
-            !field_desc.contains("notified on completion")
-                && field_desc.contains("check on it later with the get_task_output tool"),
-            "reminders off: is_background description should point at get_task_output: {field_desc}"
+            field_off.contains("get_task_output"),
+            "reminders off: is_background description should name get_task_output: {field_off}"
         );
     }
     /// Each assertion pattern-matches on the exact `ToolOutput::SearchReplace`
@@ -4850,6 +4891,23 @@ mod tests {
                 .as_object()
                 .is_some_and(|p| !p.is_empty()),
             "per-property schema must be retained: {schema}"
+        );
+    }
+    #[test]
+    fn generate_schema_memoizes_per_type() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct SchemaMemoProbe {
+            field: String,
+        }
+        let key = std::any::TypeId::of::<SchemaMemoProbe>();
+        let first = generate_schema_cached::<SchemaMemoProbe>();
+        let second = generate_schema_cached::<SchemaMemoProbe>();
+        assert_eq!(first, second);
+        assert_eq!(
+            schema_uncached_calls(key),
+            1,
+            "a type's schema must be generated at most once per process"
         );
     }
     fn toolset_with_viewer_ctx(

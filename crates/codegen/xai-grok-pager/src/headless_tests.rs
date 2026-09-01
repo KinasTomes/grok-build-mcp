@@ -120,6 +120,7 @@ fn reap_request_for_task_kills_with_session_scope() {
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
     assert_eq!(params["sessionId"], "sess-1");
     assert_eq!(params["taskId"], "task-42");
+    assert_eq!(params["source"], "teardown");
 }
 
 /// A numeric `task_id` is coerced to its string form, tracked, and reaped on exit.
@@ -151,6 +152,7 @@ fn numeric_task_id_is_decoded_tracked_and_reaped() {
     let params: serde_json::Value = serde_json::from_str(request.params.get()).unwrap();
     assert_eq!(params["taskId"], "4242");
     assert_eq!(params["sessionId"], "sess-1");
+    assert_eq!(params["source"], "teardown");
 }
 
 #[test]
@@ -200,7 +202,7 @@ fn drain_records_task_backgrounded_delivered_at_exit() {
     );
 }
 
-/// `begin_session` before the model/effort apply lets a post-open error carry the real context.
+/// `begin_session` runs before the model and effort are applied, so a post-open error carries the real context.
 #[test]
 fn post_open_error_carries_real_session_context() {
     let mut pre = reducer_for(OutputFormat::StreamingMessagesJson).unwrap();
@@ -284,7 +286,6 @@ fn headless_remote_miss_restores_conversation_instead_of_deferring_worktree() {
             RemoteMissPlan::DeferToWorktree { .. }
         ));
     }
-    // when asserting the conversation / in-place-refuse arms.
     let mut conv = headless_materialize_ctx(false, false);
     conv.allow_remote_restore = true;
     assert_eq!(

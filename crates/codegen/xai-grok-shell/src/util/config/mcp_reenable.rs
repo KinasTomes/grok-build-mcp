@@ -1,12 +1,9 @@
-//! Whether a personally disabled MCP name should appear as a re-enableable
-//! stub in `/mcps`.
+//! Whether a personally disabled MCP name should appear as a re-enableable stub in `/mcps`.
 //!
-//! Aligns list stubs with Space enable: show a row only when a definition still
-//! exists (ignoring personal disable) and org policy would not block enable.
+//! A row shows only when a definition still exists (ignoring personal disable) and org policy would not block enable.
 //! Orphans that only linger in `disabled_mcp_servers` stay hidden.
 //!
-//! Discovery is shared with session merge
-//! ([`crate::session::managed_mcp::discover_mcp_definitions_ignoring_disable`]).
+//! Discovery is shared with session merge ([`crate::session::managed_mcp::discover_mcp_definitions_ignoring_disable`]).
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -15,7 +12,6 @@ use xai_grok_workspace::permission::resolution::McpServerAllowlist;
 
 use crate::session::managed_mcp::{McpDiscoveryInputs, discover_mcp_definitions_ignoring_disable};
 
-/// Outcome of asking whether a disabled MCP should appear as a list stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisabledStubVerdict {
     /// Show a disabled row the user can Space-enable.
@@ -28,8 +24,6 @@ pub(crate) enum DisabledStubVerdict {
     HidePolicyBlocked,
 }
 
-/// Single-pass index of MCP names that still have a definition when personal
-/// disable is ignored.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct McpDefinitionIndex {
     entries: HashMap<String, acp::McpServer>,
@@ -99,8 +93,6 @@ impl McpDefinitionIndex {
     }
 }
 
-/// True when at least one disabled name is missing from the live catalog and
-/// needs a definition scan.
 pub(crate) fn needs_definition_scan(
     disabled_names: &HashSet<String>,
     catalog_names: &HashSet<String>,
@@ -108,7 +100,6 @@ pub(crate) fn needs_definition_scan(
     disabled_names.iter().any(|n| !catalog_names.contains(n))
 }
 
-/// Sorted disabled names that should get a list stub.
 pub(crate) fn reenableable_disabled_stubs(
     disabled_names: &HashSet<String>,
     catalog_names: &HashSet<String>,
@@ -317,7 +308,7 @@ args = ["ok"]
 
     #[test]
     #[serial_test::serial]
-    fn toml_duplicate_url_last_wins_matches_merge() {
+    fn toml_duplicate_url_both_kept_matches_merge() {
         let (_home, _hg, _gg) = isolated_home();
         let repo = project_repo(
             r#"
@@ -342,10 +333,10 @@ url = "https://dup.example.com/mcp"
             .iter()
             .map(|s| mcp_server_name(s).to_string())
             .collect();
-        // Last TOML entry wins the URL key on both paths.
+        // Name is the identity: a shared URL never collapses entries
+        assert!(discovered.contains_key("first"));
         assert!(discovered.contains_key("second"));
-        assert!(!discovered.contains_key("first"));
+        assert!(merged_names.contains("first"));
         assert!(merged_names.contains("second"));
-        assert!(!merged_names.contains("first"));
     }
 }

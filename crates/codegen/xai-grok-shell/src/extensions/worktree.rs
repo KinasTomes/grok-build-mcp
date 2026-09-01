@@ -146,6 +146,7 @@ fn log_effective_worktree_type(
         "WORKTREE_REQUEST_SHELL: resolved effective worktree type"
     );
 }
+#[tracing::instrument(name = "ext.worktree", skip_all, fields(method = %args.method))]
 pub async fn handle(
     agent: &MvpAgent,
     ops: &xai_grok_workspace::WorkspaceOps,
@@ -162,6 +163,7 @@ pub async fn handle(
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create",
                 request_worktree_type,
@@ -208,17 +210,16 @@ pub async fn handle(
             let mut req =
                 serde_json::from_str::<CreateWorktreeFromWorktreeRequest>(args.params.get())?;
             let request_worktree_type = req.worktree_type;
-            // Apply default if not explicitly set in request
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create_from_worktree",
                 request_worktree_type,
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
-            // Dispatch prepare through workspace
             let result = ops
                 .dispatch(
                     &xai_grok_workspace::workspace_ops::PrepareWorktreeFromWorktreeReq {
@@ -241,8 +242,7 @@ pub async fn handle(
                 })?;
 
             if result.spawn_task {
-                // Pin the resolved path so the async task reuses it instead of
-                // generating a new UUID via auto_label().
+                // Pin the resolved path so the async task reuses it instead of generating a new UUID via auto_label()
                 req.resolved_dest_path = extract_creating_path(&Ok(response.clone()));
                 let notifier = GatewayWorktreeNotifier {
                     gateway: agent.gateway.clone(),
@@ -254,7 +254,7 @@ pub async fn handle(
 
             to_response(Ok(response))
         }
-        // Synchronous variant - waits for worktree creation to complete
+        // Synchronous variant: waits for worktree creation to complete
         "x.ai/git/worktree/create_from_worktree_sync" => {
             let mut req =
                 serde_json::from_str::<CreateWorktreeFromWorktreeRequest>(args.params.get())?;
@@ -288,10 +288,10 @@ pub async fn handle(
             }
 
             let request_worktree_type = req.worktree_type;
-            // Apply default if not explicitly set in request
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create_from_worktree_sync",
                 request_worktree_type,
@@ -318,6 +318,9 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            let mut grove_worktree = None;
+            apply_grove_worktree_flag(agent, &mut grove_worktree);
+            let grove_worktree = grove_worktree.unwrap_or(false);
             let registry_client = agent.session_registry_client();
             let agent_id = xai_grok_telemetry::id::agent_id();
 
@@ -330,6 +333,7 @@ pub async fn handle(
                     registry_client.as_ref(),
                     Some(agent.auth_manager.clone()),
                     &agent_id,
+                    grove_worktree,
                 )
                 .await,
             )
@@ -431,8 +435,90 @@ pub async fn handle(
                 .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
             to_response(Ok(result))
         }
+        "x.ai/git/worktree/detach" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct DetachReq {
+                id_or_path: String,
+                #[serde(default)]
+                allow_copy: bool,
+            }
+            let req = serde_json::from_str::<DetachReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeDetachReq {
+                        id_or_path: req.id_or_path,
+                        allow_copy: req.allow_copy,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
+        "x.ai/git/worktree/salvage" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct SalvageReq {
+                id_or_path: String,
+                out: String,
+            }
+            let req = serde_json::from_str::<SalvageReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeSalvageReq {
+                        id_or_path: req.id_or_path,
+                        out: req.out,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
+        "x.ai/git/worktree/clean-artifacts" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct CleanReq {
+                id_or_path: String,
+            }
+            let req = serde_json::from_str::<CleanReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeCleanArtifactsReq {
+                        id_or_path: req.id_or_path,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+fn apply_grove_worktree_flag(agent: &MvpAgent, slot: &mut Option<bool>) {
+    let root = crate::config::load_effective_config()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let cfg = agent.cfg.borrow();
+    apply_grove_worktree_gate(slot, &root, cfg.remote_settings.as_ref());
+}
+
+/// Always run the grove gate, even when `slot` is already `Some`; the kill switch applies last.
+pub(crate) fn apply_grove_worktree_gate(
+    slot: &mut Option<bool>,
+    root: &toml::Value,
+    remote: Option<&crate::util::config::RemoteSettings>,
+) {
+    let (enabled, src) = crate::util::config::gate_grove_worktree(*slot, root, remote);
+    tracing::info!(
+        target: WORKTREE_EXT_LOG,
+        grove_worktree = enabled,
+        source = src,
+        "WORKTREE_REQUEST_SHELL: resolved grove materialize strategy"
+    );
+    *slot = Some(enabled);
 }
 
 #[cfg(test)]
@@ -478,6 +564,29 @@ mod tests {
         assert!(req.dry_run);
         assert_eq!(req.max_age.as_deref(), Some("7d"));
         assert!(req.force);
+    }
+
+    #[test]
+    fn apply_grove_worktree_gate_runs_when_slot_already_some() {
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        let mut slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(
+            slot,
+            Some(false),
+            "ACP wrapper must re-run the gate when the client already set Some(true)"
+        );
+        let mut slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, None);
+        assert_eq!(
+            slot,
+            Some(false),
+            "ACP wrapper must fail closed when remote settings are unavailable"
+        );
     }
 
     #[test]
@@ -556,8 +665,7 @@ mod tests {
 
     #[test]
     fn db_rebuild_response_carries_report_not_null() {
-        // Regression: forwarding `()` instead of the report yields `result: null`,
-        // which the CLI rejects with "ACP response missing result field".
+        // Regression: forwarding `()` instead of the report yields `result: null`, which the CLI rejects with "ACP response missing result field"
         let report = serde_json::json!({
             "discovered": 5,
             "registered": 3,

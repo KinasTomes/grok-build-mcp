@@ -1,11 +1,10 @@
 //! PTY e2e tests for the experimental `--minimal` (scrollback-native) mode.
 //!
-//! Grouped under one `mod minimal;` so the parent `pty_e2e` module isn't
-//! interleaved with a dozen `minimal_*` entries — a full-pager contributor can
-//! skip this whole subtree. These exercise the sibling `xai-grok-pager-minimal`
-//! crate end-to-end through the built binary (which installs the minimal hook),
-//! so they live with the rest of the pty suite rather than in a separate crate.
-//! Shared harness helpers are reached via `crate::common` (the family root).
+//! Grouped under one `mod minimal;` so the parent `pty_e2e` module isn't interleaved with a dozen `minimal_*` entries.
+//! A full-pager contributor can skip this whole subtree.
+//! These exercise the sibling `xai-grok-pager-minimal` crate end-to-end through the built binary (which installs the minimal hook).
+//! They therefore live with the rest of the pty suite rather than in a separate crate.
+//! Shared harness helpers are reached via `crate::common`, the root of the `pty_e2e` test crate.
 
 mod minimal_cli_screen_mode_does_not_persist;
 mod minimal_commits_response_to_scrollback;
@@ -32,6 +31,11 @@ mod minimal_short_response_stays_on_screen;
 mod minimal_slash_dropdown_dismisses_with_esc;
 mod minimal_slash_switches_from_fullscreen;
 mod minimal_slash_switches_to_fullscreen;
+mod minimal_switch_exec_escape_hatch;
+mod minimal_switch_mid_turn_keeps_streaming;
+mod minimal_switch_preserves_queued_prompt;
+mod minimal_switch_probe_failure_rolls_back;
+mod minimal_switch_round_trip_no_reprint;
 mod minimal_thinking_is_visually_distinct_from_output;
 mod minimal_transcript_opens_in_pager;
 mod minimal_transcript_pager_restore_no_artifacts;

@@ -1,6 +1,6 @@
 [package]
 name = "xai-grok-pager-bin"
-version = "1.0.1"
+version = "1.0.13"
 edition.workspace = true
 license = "Apache-2.0"
 authors = ["xAI"]
@@ -48,18 +48,17 @@ serde_json = { workspace = true }
 dunce = { workspace = true }
 semver = { workspace = true }
 xai-tty-utils = { workspace = true }
+# `collect_crashed()` for the startup crash notice.
+xai-grok-active-sessions = { workspace = true }
 xai-grok-config = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }
-rustls = { version = "0.23", default-features = false, features = [
-    "ring",
-    "logging",
-    "std",
-    "tls12",
-] }
+xai-grok-extra-ca = { workspace = true }
 
 # Binary hardening: compile-time string + control-flow obfuscation.
 obfstr = { workspace = true }
 cryptify = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -94,6 +93,9 @@ default-bazel = [
     "local-workspace",
     ]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-sys", "dep:tikv-jemalloc-ctl"]
-sandbox-enforce = ["xai-grok-pager/sandbox-enforce"]
+# xai-grok-workspace no longer enables sandbox-enforce by default, so enable it here.
+sandbox-enforce = ["xai-grok-pager/sandbox-enforce", "xai-grok-workspace/sandbox-enforce"]
 local-workspace = ["xai-grok-pager/local-workspace"]
-release-dist = ["xai-grok-pager/release-dist"]
+release-dist = [
+    "xai-grok-pager/release-dist",
+    ]

@@ -32,6 +32,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
             api_backend: Default::default(),
             auth_scheme: Default::default(),
             extra_headers: Default::default(),
+            extra_response_includes: Vec::new(),
             query_params: Default::default(),
             env_http_headers: Default::default(),
             context_window: 256_000,
@@ -59,6 +60,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         auth: None,
         parent_cwd: PathBuf::from("/tmp"),
         parent_session_id: "test-parent".into(),
+        active_message_parent_prompt_index: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         inherited_tool_overrides: None,
         yolo_mode: false,
         subagent_event_tx: tx,
@@ -81,7 +83,7 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         write_file_enabled: true,
         goal_enabled: false,
         background_workflows_enabled: false,
-        ask_user_question_enabled: true,
+        ask_user_question_enabled: false,
         parent_non_interactive: false,
         parent_cmd_tx: None,
         parent_session_info: None,
@@ -109,7 +111,9 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         subagents_max_depth: xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH,
         workflow_max_concurrent_agents:
             crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+        media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits::default(),
         inference_idle_timeout_secs: 600,
+        parent_compaction: crate::session::CompactionPins::default(),
         auto_compact_threshold_tiers: crate::agent::subagent::AutoCompactThresholdTiers::default(),
         permission_handle: None,
         worktree_type: crate::util::config::WorktreeType::Linked,
@@ -136,44 +140,14 @@ pub(crate) fn ctx_with_toggle(toggle: HashMap<String, bool>) -> SubagentSpawnCon
         synthetic_trace_tx: None,
         task_output_tool_name: xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL
             .to_string(),
+        scheduler_delete_tool_name: None,
         auto_wake_enabled: true,
         goal_loop_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         parent_terminal_backend: None,
         parent_notification_handle: None,
         parent_scheduler_handle: None,
-    }
-}
-#[derive(Default)]
-pub(crate) struct DummyLspDispatch;
-#[async_trait::async_trait]
-impl xai_grok_tools::implementations::lsp::LspBackend for DummyLspDispatch {
-    fn ensure_started_background(&self) {}
-    async fn ensure_ready(&self) -> Result<(), String> {
-        Ok(())
-    }
-    fn is_ready(&self) -> bool {
-        true
-    }
-    async fn dispatch(
-        &self,
-        _input: &xai_grok_tools::implementations::lsp::LspToolInput,
-    ) -> xai_grok_tools::implementations::lsp::LspToolResult {
-        xai_grok_tools::implementations::lsp::LspToolResult {
-            text: String::new(),
-            is_error: false,
-        }
-    }
-    async fn drain_diagnostics(
-        &self,
-        _timeout: std::time::Duration,
-    ) -> Option<xai_grok_tools::implementations::lsp::DiagnosticsSummary> {
-        None
-    }
-    async fn notify_file_changed(&self, _path: &std::path::Path, _content: &str) {}
-    async fn read_diagnostics(
-        &self,
-        _paths: &[std::path::PathBuf],
-    ) -> Vec<xai_grok_tools::implementations::lsp::FileDiagnosticEntry> {
-        vec![]
+        subagent_sampling_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            xai_grok_tools::implementations::grok_build::task::admission::DEFAULT_MAX_CONCURRENT,
+        )),
     }
 }

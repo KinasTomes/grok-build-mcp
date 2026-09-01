@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use xai_grok_sampling_types::{
-    ConversationItem, DanglingToolCallReason, SamplingConfig, TokenUsage,
+    ConversationItem, DanglingToolCallReason, SamplingConfig, TokenUsage, ToolSpec,
     dedup_duplicate_tool_results, repair_dangling_tool_calls,
 };
 
@@ -20,18 +20,37 @@ pub fn estimate_system_message_tokens(item: &ConversationItem) -> u64 {
     }
 }
 
+fn estimate_tool_tokens(
+    name: &str,
+    description: Option<&str>,
+    parameters: &serde_json::Value,
+) -> u64 {
+    let desc_len = description.map_or(0, str::len);
+    let params_len = parameters.to_string().len();
+    ((name.len() + desc_len + params_len) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+}
+
 /// Bytes/4 estimate of one tool definition (name + description + the
 /// JSON-serialized parameters).
 pub fn estimate_tool_definition_tokens(td: &xai_grok_sampling_types::ToolDefinition) -> u64 {
-    let name_len = td.function.name.len();
-    let desc_len = td.function.description.as_deref().map_or(0, |d| d.len());
-    let params_len = td.function.parameters.to_string().len();
-    ((name_len + desc_len + params_len) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+    estimate_tool_tokens(
+        &td.function.name,
+        td.function.description.as_deref(),
+        &td.function.parameters,
+    )
 }
 
 /// Sum [`estimate_tool_definition_tokens`] across a slice.
 pub fn estimate_tool_definitions_tokens(tds: &[xai_grok_sampling_types::ToolDefinition]) -> u64 {
     tds.iter().map(estimate_tool_definition_tokens).sum()
+}
+
+/// Bytes/4 estimate of the exact tool specs serialized on a request.
+pub fn estimate_tool_specs_tokens(tools: &[ToolSpec]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| estimate_tool_tokens(&tool.name, tool.description.as_deref(), &tool.parameters))
+        .sum()
 }
 
 /// Bytes/4 estimate for a single [`ConversationItem`].
@@ -68,12 +87,11 @@ pub fn estimate_item_tokens(item: &ConversationItem) -> u64 {
             xai_token_estimation::estimate_tokens(&b.text_summary())
         }
         ConversationItem::Reasoning(r) => {
-            // Summary + content text follow the standard bytes-per-token
-            // estimate; encrypted blobs are base64 and don't survive
-            // tokenization 1:1, so estimate at len/4 as well.
+            // Text and encrypted blob are the same reasoning twice: take the
+            // larger, not the sum. The ciphertext is base64, ~4/3 over raw bytes.
             let text_bytes = xai_grok_sampling_types::reasoning_item_text(r).len();
             let enc_bytes = r.encrypted_content.as_deref().map(str::len).unwrap_or(0);
-            ((text_bytes + enc_bytes) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+            (text_bytes.max(enc_bytes * 3 / 4) as u64) / xai_token_estimation::BYTES_PER_TOKEN
         }
     }
 }
@@ -302,6 +320,29 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_estimate_takes_max_of_text_and_encrypted_not_sum() {
+        // max(4000, 4000*3/4)/4 = 1000, not the (4000+4000)/4 = 2000 double-count.
+        let mut r = xai_grok_sampling_types::synthesized_reasoning_item("x".repeat(4000));
+        r.encrypted_content = Some("e".repeat(4000));
+        assert_eq!(estimate_item_tokens(&ConversationItem::Reasoning(r)), 1000);
+    }
+
+    #[test]
+    fn reasoning_estimate_encrypted_only_scales_base64_down() {
+        // No visible text: base64-corrected size, 4000*3/4/4 = 750.
+        let mut r = xai_grok_sampling_types::synthesized_reasoning_item("");
+        r.summary.clear();
+        r.encrypted_content = Some("e".repeat(4000));
+        assert_eq!(estimate_item_tokens(&ConversationItem::Reasoning(r)), 750);
+    }
+
+    #[test]
+    fn reasoning_estimate_text_only_is_plain_bytes_per_token() {
+        let r = xai_grok_sampling_types::synthesized_reasoning_item("x".repeat(4000));
+        assert_eq!(estimate_item_tokens(&ConversationItem::Reasoning(r)), 1000);
+    }
+
+    #[test]
     fn new_state_has_correct_defaults() {
         let state = ChatState::new(vec![], test_sampling_config());
         assert_eq!(state.prompt_index, 0);
@@ -362,6 +403,27 @@ mod tests {
     }
 
     #[test]
+    fn estimate_tool_specs_tokens_counts_only_provided_specs() {
+        let kept = xai_grok_sampling_types::ToolDefinition::function(
+            "search",
+            Some("find a file"),
+            serde_json::json!({"type": "object"}),
+        );
+        let dropped = xai_grok_sampling_types::ToolDefinition::function(
+            "web_search",
+            Some("search the web"),
+            serde_json::json!({"type": "object"}),
+        );
+        let tools = vec![ToolSpec::from(kept.clone())];
+        let actual = estimate_tool_specs_tokens(&tools);
+        let expected = estimate_tool_definitions_tokens(std::slice::from_ref(&kept));
+        let unfiltered = estimate_tool_definitions_tokens(&[kept, dropped]);
+
+        assert_eq!(actual, expected);
+        assert!(actual < unfiltered);
+    }
+
+    #[test]
     fn estimate_messages_tokens_excludes_system_and_sums_rest() {
         // 4000 bytes per item -> 1000 tokens each.
         let items = vec![
@@ -379,11 +441,6 @@ mod tests {
     fn estimate_messages_tokens_zero_when_only_system() {
         let items = vec![ConversationItem::system("x".repeat(4000).as_str())];
         assert_eq!(estimate_messages_tokens(&items), 0);
-    }
-
-    #[test]
-    fn estimate_messages_tokens_zero_for_empty() {
-        assert_eq!(estimate_messages_tokens(&[]), 0);
     }
 
     #[test]

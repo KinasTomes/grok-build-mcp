@@ -24,6 +24,7 @@ xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-sandbox = { path = "../xai-grok-sandbox" }
 xai-grok-mcp = { workspace = true }
 xai-grok-config-types = { workspace = true }
+xai-grok-session-events = { workspace = true }
 xai-grok-tools = { workspace = true }
 
 [dev-dependencies]

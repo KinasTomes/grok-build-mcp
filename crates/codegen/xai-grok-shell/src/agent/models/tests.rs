@@ -34,7 +34,6 @@ fn cold_manager(cfg: config::Config, endpoint: Arc<dyn ModelsEndpoint>) -> Model
     .build()
 }
 
-/// Never resolves.
 struct HangingEndpoint;
 impl ModelsEndpoint for HangingEndpoint {
     fn fetch_models(
@@ -47,7 +46,6 @@ impl ModelsEndpoint for HangingEndpoint {
     }
 }
 
-/// Fails every fetch immediately.
 struct FailingEndpoint;
 impl ModelsEndpoint for FailingEndpoint {
     fn fetch_models(
@@ -60,7 +58,6 @@ impl ModelsEndpoint for FailingEndpoint {
     }
 }
 
-/// Serves `catalog` after `delay`.
 struct SlowEndpoint {
     catalog: IndexMap<String, ModelEntry>,
     delay: std::time::Duration,
@@ -281,8 +278,6 @@ async fn hanging_fetch_does_not_block_refresh() {
 
 #[tokio::test(start_paused = true)]
 async fn slow_fetch_within_timeout_still_applies() {
-    // "Slow but succeeds": a fetch that returns just under STARTUP_FETCH_TIMEOUT
-    // must still be applied, not degraded to offline.
     let mgr = cold_manager(
         config::Config::default(),
         Arc::new(SlowEndpoint {
@@ -350,7 +345,7 @@ async fn etag_refresh_is_bounded_and_single_flighted() {
     tokio::time::sleep(crate::http::STARTUP_FETCH_TIMEOUT * 2).await;
     tokio::task::yield_now().await;
 
-    // Guard released → a later etag change fetches again.
+    // Once the guard is released, a later etag change fetches again
     mgr.spawn_fetch_inner(Some("etag-3".into()), /*remote_fetch_enabled*/ true);
     tokio::task::yield_now().await;
     assert_eq!(
@@ -371,8 +366,7 @@ async fn etag_refresh_is_bounded_and_single_flighted() {
 
 #[tokio::test(start_paused = true)]
 async fn first_catalog_wait_unblocks_on_fetch_and_skips_dead_dwell() {
-    // Deployment auth: a fetch can succeed without a session, so the wait
-    // dwells regardless of ambient API-key env.
+    // Deployment auth: a fetch can succeed without a session, so the wait dwells regardless of any API key in the environment
     let mgr = cold_manager(
         config_from_toml("[endpoints]\ndeployment_key = \"deploy-key\""),
         Arc::new(SlowEndpoint {
@@ -590,6 +584,42 @@ fn model_show_model_fingerprint_reads_catalog_flag() {
 }
 
 #[test]
+fn reasoning_effort_helpers_resolve_wire_name_to_catalog_key() {
+    let mgr = test_manager();
+
+    let mut custom = ModelEntry {
+        info: config::ModelInfo::fallback("enterprise-slug"),
+        api_key: None,
+        env_key: None,
+        auth_provider: None,
+        api_base_url: None,
+    };
+    custom.info.supports_reasoning_effort = true;
+    custom.info.reasoning_effort = Some(ReasoningEffort::High);
+    custom.info.reasoning_efforts = vec![ReasoningEffortOption {
+        id: "high".into(),
+        value: ReasoningEffort::High,
+        label: "High".into(),
+        description: None,
+        default: true,
+    }];
+    mgr.insert_test_entry("enterprise-key", custom);
+
+    for id in ["enterprise-key", "enterprise-slug"] {
+        assert!(mgr.model_supports_reasoning_effort(id));
+        assert_eq!(
+            mgr.model_default_reasoning_effort(id),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(mgr.model_reasoning_efforts(id).len(), 1);
+    }
+
+    assert!(!mgr.model_supports_reasoning_effort("missing-model"));
+    assert_eq!(mgr.model_default_reasoning_effort("missing-model"), None);
+    assert!(mgr.model_reasoning_efforts("missing-model").is_empty());
+}
+
+#[test]
 fn default_model_honors_allowlist_when_no_default_set() {
     let cfg = config_from_toml(
         r#"
@@ -729,7 +759,7 @@ fn reselect_missing_current_model_bumps_watch() {
     mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["grok-4", "grok-3"])), None);
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
     let start = mgr.model_switch_generation();
-    // A later catalog drops the current model → reselect_current_model_if_missing.
+    // A later catalog drops the current model, so reselect_current_model_if_missing runs
     mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["grok-3"])), None);
     assert_ne!(mgr.current_model_id().0.as_ref(), "grok-4");
     assert!(
@@ -958,6 +988,11 @@ fn config_menu_only_model_derives_support_and_default() {
     assert_eq!(mgr.model_reasoning_efforts("menu-only").len(), 2);
     assert!(!mgr.model_supports_reasoning_effort("plain"));
     assert_eq!(mgr.model_default_reasoning_effort("plain"), None);
+
+    mgr.set_current_model_id(acp::ModelId::new("plain"));
+    assert_eq!(mgr.current_model_id().0.as_ref(), "plain");
+    assert_eq!(mgr.model_reasoning_efforts("menu-only").len(), 2);
+    assert!(mgr.model_reasoning_efforts("plain").is_empty());
 }
 
 #[test]
@@ -1048,9 +1083,8 @@ fn spawn_background_refresh_is_noop_when_real_catalog_present() {
     assert!(mgr.has_fetched_real_catalog());
 }
 
-// Guards the readiness-never-blocks invariant in CI; the e2e proofs are `#[ignore]`.
-// current_thread: the post-spawn `!polled` check relies on the task not being
-// polled until this test awaits.
+// Guards in CI that the background refresh never blocks the readiness path; the e2e proofs are `#[ignore]`
+// current_thread: the post-spawn `!polled` check relies on the task not being polled until this test awaits
 #[tokio::test(flavor = "current_thread")]
 async fn spawn_background_refresh_never_blocks_on_a_hanging_endpoint() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1680,12 +1714,12 @@ fn campaign_only_flip_does_not_reselect_live_session() {
     let mut cfg = config::Config::default();
     cfg.models.default = Some("alpha".to_string());
     mgr.apply_refresh_result(&cfg, Some(make_prefetched(&["alpha", "beta"])), None);
-    *mgr.inner.cfg.write() = cfg.clone(); // old_preferred = "alpha"
+    *mgr.inner.cfg.write() = cfg.clone(); // apply_config sees old_preferred as "alpha"
     assert_eq!(mgr.current_model_id().0.as_ref(), "alpha");
 
     let mut new_cfg = config::Config::default();
     new_cfg.models.default = Some("beta".to_string());
-    new_cfg.models.default_is_campaign_driven = true; // campaign overriding
+    new_cfg.models.default_is_campaign_driven = true;
     mgr.apply_config(new_cfg);
     assert_eq!(
         mgr.current_model_id().0.as_ref(),
@@ -1983,6 +2017,7 @@ fn make_entry_config_with_id(
 ) -> config::ModelEntryConfig {
     config::ModelEntryConfig {
         id: id.map(|s| s.to_owned()),
+        model_family: None,
         model: model.to_owned(),
         base_url: "https://test.api/v1".to_owned(),
         name: name.map(|n| n.to_owned()),
@@ -2002,6 +2037,7 @@ fn make_entry_config_with_id(
         agent_type: config::default_agent_type(),
         inference_idle_timeout_secs: None,
         max_retries: None,
+        subagent_rate_limit_max_attempts: None,
         hidden: false,
         supported_in_api: true,
         auth_scheme: None,
@@ -2014,6 +2050,7 @@ fn make_entry_config_with_id(
         show_model_fingerprint: false,
         stream_tool_calls: None,
         laziness_detector: config::LazinessDetectorPerModelConfig::default(),
+        variants: Vec::new(),
     }
 }
 
@@ -2215,8 +2252,7 @@ fn test_available_keys(keys: &[&str]) -> IndexMap<acp::ModelId, acp::ModelInfo> 
 
 #[tokio::test(start_paused = true)]
 async fn bounded_auth_refresh_times_out_to_none() {
-    // A hung IdP (never-ready auth future) must degrade to None within the
-    // bound so a cold-cache boot fetch can't stall on it.
+    // A hung identity provider (a never-ready auth future) must degrade to None within the bound so a cold-cache boot fetch can't stall on it
     let started = tokio::time::Instant::now();
     let result =
         ModelsManager::bounded_auth_refresh(std::future::pending::<Option<GrokAuth>>()).await;
@@ -2239,8 +2275,7 @@ async fn bounded_auth_refresh_passes_through_ready_value() {
 
 #[tokio::test]
 async fn explicit_model_pick_survives_first_real_catalog() {
-    // Non-blocking boot lets the user pick a model before the first real
-    // catalog lands; that pick must not be clobbered by default reselection.
+    // Non-blocking boot lets the user pick a model before the first real catalog lands; that pick must not be clobbered by default reselection
     let mgr = test_manager();
     let cfg = config_from_toml("[models]\ndefault = \"grok-4.5\"");
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));
@@ -2254,8 +2289,7 @@ async fn explicit_model_pick_survives_first_real_catalog() {
 
 #[tokio::test]
 async fn identity_switch_clears_user_pick_latch() {
-    // After an identity change (`clear()`), the new identity's first catalog must
-    // reselect its own default rather than inherit the prior user's pick.
+    // After an identity change (`clear()`), the new identity's first catalog must reselect its own default rather than inherit the prior user's pick
     let mgr = test_manager();
     let cfg = config_from_toml("[models]\ndefault = \"grok-4.5\"");
     mgr.set_current_model_id(acp::ModelId::new("grok-4"));

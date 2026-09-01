@@ -14,6 +14,7 @@
 //! - `SubagentForegroundWait` — host wait-window guard factory (optional)
 //! - `TaskModelValidator` — validates explicit model slugs before spawn
 
+mod active_message;
 pub mod admission;
 pub mod backend;
 pub mod coordinator;
@@ -436,6 +437,10 @@ impl xai_tool_runtime::Tool for TaskTool {
             }
         }
 
+        // The wait window must cover eager validation too: a user prompt
+        // should interject if the coordinator stalls.
+        let foreground_wait = foreground_wait.map(|wait| wait.enter());
+
         // 2. Eager validation — catch unknown / disabled / not-allowed
         //    types before the fire-and-forget background spawn.
         match backend
@@ -468,14 +473,24 @@ impl xai_tool_runtime::Tool for TaskTool {
                     input.subagent_type
                 )));
             }
-            SubagentValidateTypeOutcome::ValidationUnavailable => {
-                // `custom` (not `invalid_arguments`) so the model doesn't
-                // retry with a different name on transport faults.
+            // `custom` (not `invalid_arguments`) so the model doesn't
+            // retry with a different name on transport faults.
+            SubagentValidateTypeOutcome::CoordinatorGone => {
                 return Err(xai_tool_runtime::ToolError::custom(
                     "validation_unavailable",
                     format!(
-                        "Cannot validate subagent type '{}': the subagent coordinator is \
-                         unreachable. Retry shortly or notify ops.",
+                        "Cannot validate subagent type '{}': the subagent coordinator \
+                         has shut down. Retrying will not help.",
+                        input.subagent_type
+                    ),
+                ));
+            }
+            SubagentValidateTypeOutcome::ValidationUnavailable => {
+                return Err(xai_tool_runtime::ToolError::custom(
+                    "validation_unavailable",
+                    format!(
+                        "Cannot validate subagent type '{}': the subagent coordinator did \
+                         not respond (it may be busy). Retry shortly.",
                         input.subagent_type
                     ),
                 ));
@@ -526,6 +541,8 @@ impl xai_tool_runtime::Tool for TaskTool {
                 model_override_provenance: ModelOverrideProvenance::Tool,
                 reasoning_effort: None,
                 persona: None,
+                // JSON cannot set this field. Compat-harness adapters still
+                // populate it in-process; model-facing spawns stay `None`.
                 capability_mode: input.capability_mode,
                 isolation: input.isolation,
                 // Model-issued `task` spawns never override the harness; the
@@ -552,6 +569,7 @@ impl xai_tool_runtime::Tool for TaskTool {
         // Both transport errors and coordinator rejections are logged so
         // late failures (worktree creation, etc.) remain visible.
         if input.run_in_background {
+            drop(foreground_wait);
             let bg_backend = backend.clone();
             let bg_id = id.clone();
             let bg_type = input.subagent_type.clone();
@@ -599,7 +617,6 @@ impl xai_tool_runtime::Tool for TaskTool {
         }
 
         // 5. Blocking mode (default): spawn via backend and await result
-        let _foreground_wait = foreground_wait.map(|wait| wait.enter());
         let result = backend.backend().spawn(request).await;
         if let Some(forwarder) = cancellation_forwarder {
             forwarder.abort();
@@ -1542,12 +1559,108 @@ mod tests {
             task_input("explore", true),
         )
         .await;
-        let msg = result.expect_err("must error").to_string();
+        let err = result.expect_err("must error");
         assert!(
-            msg.contains("subagent coordinator is unreachable")
+            matches!(err.kind, xai_tool_runtime::ToolErrorKind::Custom),
+            "transport faults must not be invalid_arguments (the model would \
+             retry with a mutated name): {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("subagent coordinator did not respond")
                 && msg.contains("Cannot validate subagent type"),
         );
         assert!(!msg.contains("Unknown subagent type"));
+    }
+
+    /// The send-now wait window must already be open during the eager
+    /// validation await in both modes — a busy coordinator can hold it for
+    /// seconds, and a user prompt in that window should interject, not queue.
+    #[tokio::test]
+    async fn foreground_wait_covers_eager_validation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct DepthGuard(Arc<AtomicUsize>);
+        impl Drop for DepthGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        for run_in_background in [false, true] {
+            let wait_depth = Arc::new(AtomicUsize::new(0));
+            let depth_seen_by_validation = Arc::new(AtomicUsize::new(usize::MAX));
+
+            let depth_for_validation = Arc::clone(&wait_depth);
+            let seen = Arc::clone(&depth_seen_by_validation);
+            let (backend, mut rx) = make_backend_with_validation_fn(move |_, _| {
+                seen.store(
+                    depth_for_validation.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
+                SubagentValidateTypeOutcome::Ok
+            });
+
+            let mut resources = resources_for_task(backend);
+            let depth_for_factory = Arc::clone(&wait_depth);
+            resources.insert(SubagentForegroundWait::new(move || {
+                depth_for_factory.fetch_add(1, Ordering::SeqCst);
+                Box::new(DepthGuard(Arc::clone(&depth_for_factory)))
+            }));
+
+            let drain = tokio::spawn(async move {
+                if let Some(SubagentEvent::Spawn(boxed)) = rx.recv().await {
+                    let _ = boxed.respond_with(|boxed| SubagentResult {
+                        success: true,
+                        subagent_id: boxed.id.clone(),
+                        child_session_id: boxed.id.clone(),
+                        ..Default::default()
+                    });
+                }
+            });
+
+            let result = xai_tool_runtime::Tool::run(
+                &TaskTool,
+                test_ctx(resources.into_shared()),
+                task_input("explore", run_in_background),
+            )
+            .await;
+            assert!(result.is_ok(), "bg={run_in_background}: {result:?}");
+            assert_eq!(
+                depth_seen_by_validation.load(Ordering::SeqCst),
+                1,
+                "bg={run_in_background}: wait window must be open while validation is in flight"
+            );
+            assert_eq!(
+                wait_depth.load(Ordering::SeqCst),
+                0,
+                "bg={run_in_background}: guard must be released after the run"
+            );
+            drain.await.unwrap();
+        }
+    }
+
+    /// A closed coordinator channel is terminal — every retry fails
+    /// instantly, so the error must not invite one.
+    #[tokio::test]
+    async fn coordinator_gone_error_does_not_invite_retry() {
+        let (tx, rx) = mpsc::unbounded_channel::<SubagentEvent>();
+        drop(rx);
+        let backend = SubagentBackendResource(Arc::new(ChannelBackend::new(tx)));
+        let resources = resources_for_task(backend);
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(resources.into_shared()),
+            task_input("explore", true),
+        )
+        .await;
+        let msg = result.expect_err("must error").to_string();
+        assert!(msg.contains("has shut down"), "{msg}");
+        assert!(
+            !msg.contains("Retry shortly"),
+            "terminal fault must not invite a retry: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1605,7 +1718,7 @@ mod tests {
     // ── Runtime overrides serde tests ─────────────────
 
     #[test]
-    fn runtime_overrides_parse() {
+    fn capability_mode_in_json_is_ignored() {
         let input: TaskToolInput = serde_json::from_str(
             r#"{
                 "description": "d",
@@ -1614,20 +1727,20 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(
-            input.capability_mode,
-            Some(SubagentCapabilityMode::ReadOnly)
+        assert!(
+            input.capability_mode.is_none(),
+            "model-facing JSON must not set capability_mode"
         );
     }
 
     #[test]
     fn partial_overrides_leave_rest_none() {
-        let input: TaskToolInput = serde_json::from_str(
-            r#"{"description": "d", "prompt": "p", "capability_mode": "execute"}"#,
-        )
-        .unwrap();
-        assert_eq!(input.capability_mode, Some(SubagentCapabilityMode::Execute));
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description": "d", "prompt": "p", "isolation": "worktree"}"#)
+                .unwrap();
+        assert_eq!(input.isolation, Some(SubagentIsolationMode::Worktree));
         assert!(input.model.is_none());
+        assert!(input.capability_mode.is_none());
     }
 
     #[test]
@@ -1639,6 +1752,15 @@ mod tests {
              available model slugs. If omitted, the subagent uses the same model as the parent \
              agent. Do not pass if resume_from is set (prior model will be used). Only choose \
              an explicit model when the user directly requests it."
+        );
+    }
+
+    #[test]
+    fn task_tool_input_schema_omits_capability_mode() {
+        let schema = serde_json::to_value(schemars::schema_for!(TaskToolInput)).unwrap();
+        assert!(
+            schema["properties"].get("capability_mode").is_none(),
+            "capability_mode must not be advertised on the model-facing schema"
         );
     }
 
@@ -1668,9 +1790,9 @@ mod tests {
         let json = serde_json::to_string(&input).unwrap();
         let parsed: TaskToolInput = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.description, "find bugs");
-        assert_eq!(
-            parsed.capability_mode,
-            Some(SubagentCapabilityMode::ReadOnly)
+        assert!(
+            parsed.capability_mode.is_none(),
+            "capability_mode is harness-only and must not round-trip through JSON"
         );
         assert_eq!(parsed.model.as_deref(), Some("test-model"));
     }
@@ -1683,17 +1805,16 @@ mod tests {
             ("execute", SubagentCapabilityMode::Execute),
             ("all", SubagentCapabilityMode::All),
         ] {
-            let json =
-                format!(r#"{{"description":"d","prompt":"p","capability_mode":"{json_val}"}}"#);
-            let input: TaskToolInput = serde_json::from_str(&json).unwrap();
-            assert_eq!(input.capability_mode, Some(expected), "for {json_val}");
+            let parsed: SubagentCapabilityMode =
+                serde_json::from_value(serde_json::json!(json_val)).unwrap();
+            assert_eq!(parsed, expected, "for {json_val}");
         }
     }
 
     #[test]
     fn capability_mode_rejects_invalid_value() {
-        let json = r#"{"description":"d","prompt":"p","capability_mode":"invalid_mode"}"#;
-        let result = serde_json::from_str::<TaskToolInput>(json);
+        let result =
+            serde_json::from_value::<SubagentCapabilityMode>(serde_json::json!("invalid_mode"));
         assert!(result.is_err(), "unknown value should be rejected");
     }
 
@@ -1717,10 +1838,9 @@ mod tests {
             ("All", SubagentCapabilityMode::All, "all"),
             ("ALL", SubagentCapabilityMode::All, "all"),
         ] {
-            let json = format!(r#"{{"description":"d","prompt":"p","capability_mode":"{alias}"}}"#);
-            let input: TaskToolInput = serde_json::from_str(&json)
+            let parsed: SubagentCapabilityMode = serde_json::from_value(serde_json::json!(alias))
                 .unwrap_or_else(|e| panic!("alias {alias:?} should parse: {e}"));
-            assert_eq!(input.capability_mode, Some(expected), "parse {alias:?}");
+            assert_eq!(parsed, expected, "parse {alias:?}");
             assert_eq!(
                 serde_json::to_value(expected).unwrap(),
                 canonical,
