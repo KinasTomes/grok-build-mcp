@@ -31,13 +31,15 @@ pub struct AuthMeta {
     pub coding_data_retention_opt_out: bool,
     #[serde(default)]
     pub show_resolved_model: Option<bool>,
-    /// `Some` = user is blocked; `None` = user has access.
+    /// `Some` means the user is blocked; `None` means the user has access.
     #[serde(default)]
     pub gate: Option<GateInfo>,
-    /// User-friendly display name for the current subscription tier
-    /// (e.g. "SuperGrok Heavy", "X Premium", "Free"). From CCP `/settings`.
+    /// Display name for the current subscription tier (e.g. "SuperGrok Heavy", "X Premium", "Free"), from CCP `/settings`.
     #[serde(default)]
     pub subscription_tier: Option<String>,
+    /// Whether `/feedback` may offer a one-shot trace upload; it lives on auth meta so it refreshes with auth changes.
+    #[serde(default)]
+    pub feedback_trace_offer: bool,
 }
 
 impl Default for AuthMeta {
@@ -53,6 +55,7 @@ impl Default for AuthMeta {
             show_resolved_model: None,
             gate: None,
             subscription_tier: None,
+            feedback_trace_offer: false,
         }
     }
 }

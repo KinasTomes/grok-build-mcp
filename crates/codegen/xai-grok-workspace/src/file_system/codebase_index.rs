@@ -1,9 +1,5 @@
-//! Codebase Index Manager
-//!
 //! Manages code graph indexes for code navigation features (go-to-definition, go-to-references).
 //! Indexes are shared across sessions with the same cwd to avoid duplicate work.
-//!
-//! ## Deduplication
 //!
 //! Deduplication happens at two levels:
 //! 1. **Process-level**: `IndexManager::spawn()` ensures at most one manager per workspace per process
@@ -17,8 +13,6 @@ use xai_codebase_graph::{IndexManager, IndexManagerConfig, IndexManagerHandle};
 
 use xai_grok_tools::util::grok_home::grok_home;
 
-/// Get the cache path for a cwd's index.
-///
 /// Cache is stored in: `~/.grok/indexes/{url_encoded_cwd}/goto_index.bin`
 pub fn get_index_cache_path(cwd: &Path) -> PathBuf {
     let encoded = urlencoding::encode(&cwd.to_string_lossy()).into_owned();
@@ -28,11 +22,8 @@ pub fn get_index_cache_path(cwd: &Path) -> PathBuf {
         .join("goto_index.bin")
 }
 
-/// Manages code graph indexes across sessions.
-///
-/// Wraps `IndexManager::spawn()` with cache-path config and cross-session
-/// handle reuse. Keeps only `Weak` refs — sessions hold the strong `Arc`s,
-/// so the actor is reaped when the last session in a git-root closes.
+/// Wraps `IndexManager::spawn()` with cache-path config and cross-session handle reuse.
+/// Keeps only `Weak` refs; sessions hold the strong `Arc`s, so the actor is reaped when the last session in a git-root closes.
 pub struct CodebaseIndexManager {
     indexes: HashMap<PathBuf, Weak<IndexManagerHandle>>,
 }
@@ -91,9 +82,30 @@ impl CodebaseIndexManager {
         (handle, true)
     }
 
-    /// Get the running index for `cwd`, or `None` if not started / already reaped.
+    /// Get the running index for `cwd`, or `None` if not started or already reaped.
     pub fn get(&self, cwd: &Path) -> Option<Arc<IndexManagerHandle>> {
         self.indexes.get(cwd).and_then(Weak::upgrade)
+    }
+
+    /// Index whose root is the longest prefix of `path` (multi-repo dispatch).
+    ///
+    /// Upgrades first, then picks the longest *live* covering root.
+    /// If the longest-prefix root's `Weak` is already dead, a shorter but still-live covering root is used instead of returning `None`.
+    pub fn get_covering(&self, path: &Path) -> Option<Arc<IndexManagerHandle>> {
+        self.indexes
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .filter_map(|(root, weak)| weak.upgrade().map(|handle| (root, handle)))
+            .max_by_key(|(root, _)| root.as_os_str().len())
+            .map(|(_, handle)| handle)
+    }
+
+    /// Ensure an index exists for every materialized mount.
+    pub fn ensure_all(&mut self, roots: &[PathBuf]) -> Vec<Arc<IndexManagerHandle>> {
+        roots
+            .iter()
+            .map(|root| self.get_or_create(root.clone()).0)
+            .collect()
     }
 
     /// Returns the number of currently-live indexes (test helper).
@@ -115,7 +127,7 @@ mod tests {
         let cwd = Path::new("/Users/test/my project");
         let cache_path = get_index_cache_path(cwd);
 
-        // Should contain URL-encoded path
+        // The cwd is URL-encoded into the directory name (`/` becomes `%2F`)
         assert!(cache_path.to_string_lossy().contains("%2F"));
         assert!(cache_path.to_string_lossy().ends_with("goto_index.bin"));
     }
@@ -123,21 +135,16 @@ mod tests {
     // =========================================================================
     // Lazy-start mechanic tests
     //
-    // These tests verify the core lazy-start behavior:
-    // `CodebaseIndexManager::get()` returns None before the index is created,
-    // which maps to `x.ai/code/status` reporting `reason: notStarted`.
-    // `get_or_create()` is the lazy-start entry point called by
-    // `MvpAgent::start_codebase_index_for_code_nav` on the first code-nav
-    // request for an eligible session.
+    // `CodebaseIndexManager::get()` returns None before the index is created, which maps to `x.ai/code/status` reporting `reason: notStarted`
+    // `get_or_create()` is the lazy-start entry point
+    // `MvpAgent::start_codebase_index_for_code_nav` calls it on the first code-nav request for an eligible session
     // =========================================================================
 
     /// An empty CodebaseIndexManager returns None for any path.
     ///
     /// This is the steady-state before ANY code-nav request has been made.
-    /// In `x.ai/code/status`, `resolve_index_handle()` calls
-    /// `agent.get_codebase_index(cwd)` which calls `mgr.get(cwd)`.
-    /// When this returns None the status reports `reason: notStarted` — the
-    /// key non-starting guarantee from the plan.
+    /// In `x.ai/code/status`, `resolve_index_handle()` calls `agent.get_codebase_index(cwd)` which calls `mgr.get(cwd)`.
+    /// When this returns None the status reports `reason: notStarted`.
     #[test]
     fn test_get_returns_none_before_any_index_created() {
         let mgr = CodebaseIndexManager::new();
@@ -148,10 +155,38 @@ mod tests {
         );
     }
 
+    /// `get_covering` must skip a dead longest-prefix `Weak` and fall back to a shorter but still-live covering root.
+    /// Regression: it used to pick the longest prefix first and return `None` if that one was dead.
+    #[test]
+    fn get_covering_skips_dead_weak_for_shorter_live_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let outer = temp.path().join("ws");
+        let inner = outer.join("app");
+        std::fs::create_dir_all(&inner).unwrap();
+
+        let mut mgr = CodebaseIndexManager::new();
+        let outer_handle = mgr.get_or_create(outer.clone()).0;
+        let inner_handle = mgr.get_or_create(inner.clone()).0;
+
+        let file = inner.join("src/main.rs");
+        // While both are live, the longest prefix (`inner`) wins.
+        assert!(std::sync::Arc::ptr_eq(
+            &mgr.get_covering(&file).expect("live inner"),
+            &inner_handle
+        ));
+
+        // Drop the longest root's strong ref: its `Weak` is now dead
+        // Covering must fall back to the shorter live `outer`, not return `None`
+        drop(inner_handle);
+        let covering = mgr.get_covering(&file).expect("fall back to live outer");
+        assert!(std::sync::Arc::ptr_eq(&covering, &outer_handle));
+
+        drop(outer_handle);
+    }
+
     /// get() returns None even after another path was indexed.
     ///
-    /// Proves path-scoped isolation: a different cwd's index does not
-    /// satisfy a lookup for an unrelated path.
+    /// Proves path-scoped isolation: a different cwd's index does not satisfy a lookup for an unrelated path.
     #[test]
     fn test_get_returns_none_for_different_cwd() {
         let temp = tempfile::tempdir().unwrap();
@@ -162,7 +197,7 @@ mod tests {
         let mut mgr = CodebaseIndexManager::new();
         let (_handle, _) = mgr.get_or_create(root_a.clone());
 
-        // root_b was never indexed — must return None.
+        // root_b was never indexed
         assert!(
             mgr.get(&root_b).is_none(),
             "get() for an un-indexed path must return None (path-scoped isolation)"
@@ -171,10 +206,8 @@ mod tests {
 
     /// After get_or_create() the same path is found by get().
     ///
-    /// This is the lazy-start path: `get_or_create` is called by
-    /// `start_codebase_index_for_code_nav` on the first eligible code-nav
-    /// request, after which `get_codebase_index` (used by `resolve_index_handle`
-    /// in `code_status`) returns `Some`.
+    /// This is the lazy-start path: `get_or_create` is called by `start_codebase_index_for_code_nav` on the first eligible code-nav request.
+    /// After that, `get_codebase_index` (used by `resolve_index_handle` in `code_status`) returns `Some`.
     #[test]
     fn test_get_finds_handle_after_get_or_create() {
         let temp = tempfile::tempdir().unwrap();
@@ -182,7 +215,6 @@ mod tests {
 
         let mut mgr = CodebaseIndexManager::new();
 
-        // Before lazy-start: get() returns None.
         assert!(mgr.get(&root).is_none(), "no index before get_or_create");
 
         // Lazy-start: this is what start_codebase_index_for_code_nav calls.
@@ -201,11 +233,8 @@ mod tests {
 
     /// The index is reaped once the last strong handle drops.
     ///
-    /// This is the eviction guarantee: the manager holds only a `Weak`, so when
-    /// the last session pinning a git-root is torn down (here simulated by
-    /// dropping the sole `Arc`), `get()` stops returning the handle and the
-    /// entry no longer counts as active — no per-repo accumulation in a
-    /// long-lived leader process.
+    /// This is the eviction guarantee: the manager holds only a `Weak`, so dropping the sole `Arc` (the last session) makes `get()` miss.
+    /// Nothing accumulates per repo in a long-lived leader process.
     #[test]
     fn test_index_evicted_when_last_strong_ref_dropped() {
         let temp = tempfile::tempdir().unwrap();
@@ -265,7 +294,7 @@ mod tests {
             "index still live after only the first session drops"
         );
 
-        // Last session ends: now — and only now — the index is reaped.
+        // Last session ends: only now is the index reaped
         drop(session_b);
         assert!(
             mgr.get(&root).is_none(),
@@ -279,10 +308,6 @@ mod tests {
     }
 
     /// A second get_or_create() for the same path reuses the existing handle.
-    ///
-    /// This corresponds to "subsequent code-nav requests reuse the same shared
-    /// handle" from the plan: once the index is running, all subsequent
-    /// get_or_create calls for the same path return the existing Arc.
     #[test]
     fn test_get_or_create_is_idempotent_for_same_path() {
         let temp = tempfile::tempdir().unwrap();

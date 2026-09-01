@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use xai_grok_sampling_types::ReasoningEffort;
 use xai_workflow::{Journal, WorkflowOutcome, WorkflowRunParams};
 
 use super::host_service::{
@@ -28,6 +29,7 @@ pub(crate) struct LaunchSpec {
     pub objective: String,
     pub args: serde_json::Value,
     pub agent_budget: Option<u64>,
+    pub effort: Option<ReasoningEffort>,
     pub resume_run_id: Option<String>,
 }
 
@@ -118,7 +120,7 @@ impl WorkflowManager {
     pub(crate) fn launch(
         &mut self,
         resolved: ResolvedWorkflow,
-        spec: LaunchSpec,
+        mut spec: LaunchSpec,
     ) -> Result<(String, oneshot::Receiver<WorkflowOutcome>), LaunchError> {
         self.reap_terminal_runs();
         if self.active.len().saturating_add(self.retiring.len())
@@ -152,6 +154,7 @@ impl WorkflowManager {
                 let original_args = self.store.args_for(run_id).ok_or_else(|| {
                     LaunchError::Store("immutable launch args are missing".into())
                 })?;
+                spec.effort = self.store.effort_for(run_id);
                 if original_args != spec.args {
                     return Err(LaunchError::Store(
                         "workflow launch args are immutable across resume".into(),
@@ -206,7 +209,7 @@ impl WorkflowManager {
                 let run_id = format!("wf_{}", uuid::Uuid::now_v7().simple());
                 let agent_budget = spec.agent_budget.unwrap_or(WORKFLOW_DEFAULT_AGENT_BUDGET);
                 self.store
-                    .register(&run_id, &execution_script, &spec.args)
+                    .register(&run_id, &execution_script, &spec.args, spec.effort)
                     .map_err(|error| LaunchError::Store(error.to_string()))?;
                 let journal_rel = format!("workflows/{run_id}/journal.jsonl");
                 let journal_path = self.session_dir.as_ref().map(|d| d.join(&journal_rel));
@@ -241,6 +244,11 @@ impl WorkflowManager {
         self.notify
             .emit(&state, self.tracker.lock().elapsed_ms(&run_id), 0);
 
+        let active = xai_grok_telemetry::activity::WORKFLOW_RUNS_ACTIVE.enter();
+        debug_assert!(
+            xai_grok_telemetry::activity::WORKFLOW_RUNS_ACTIVE.get() >= 1,
+            "WorkflowRunStarted must stamp a self-inclusive count"
+        );
         log_run_started(
             &run_id,
             &self.session_id,
@@ -273,6 +281,7 @@ impl WorkflowManager {
                 subagent_event_tx: self.subagent_event_tx.clone(),
                 parent_session_id: self.session_id.clone(),
                 allow_fork_context,
+                effort: spec.effort,
                 templates: self.templates.clone(),
                 telemetry: self.telemetry.clone(),
                 stats: agent_stats.clone(),
@@ -317,6 +326,7 @@ impl WorkflowManager {
         let watcher_agent_stats = agent_stats;
         let execution_epoch = self.tracker.lock().execution_epoch(&run_id).unwrap_or(0);
         tokio::spawn(async move {
+            let _active = active;
             let mut outcome = exec.await.unwrap_or_else(|e| WorkflowOutcome::Failed {
                 error: format!("workflow executor panicked: {e}"),
             });
@@ -338,8 +348,7 @@ impl WorkflowManager {
                             .into(),
                 };
             }
-            // Epoch check and lifecycle mutation stay under one lock, or a
-            // quick resume could let this stale watcher stomp the successor.
+            // Epoch check and lifecycle mutation stay under one lock, or a quick resume could let this stale watcher stomp the successor
             let (epoch_matches, state) = {
                 let mut tracker = tracker.lock();
                 if tracker.execution_epoch(&watcher_run_id) != Some(execution_epoch) {
@@ -365,8 +374,7 @@ impl WorkflowManager {
                 }
             };
             if !epoch_matches {
-                // A quick resume took over; close this episode as superseded
-                // (cumulative fields may reflect the successor).
+                // A quick resume took over; close this episode as superseded (cumulative fields may reflect the successor)
                 let (elapsed, agents_used, agent_budget) = {
                     let tracker = tracker.lock();
                     let run = tracker.get(&watcher_run_id);
@@ -392,8 +400,7 @@ impl WorkflowManager {
                 return;
             }
             if state.is_none() {
-                // The run left the tracker; close the episode so its
-                // `workflow_run_started` is not orphaned.
+                // The run left the tracker; close the episode so its `workflow_run_started` is not orphaned
                 log_run_ended(
                     RunEndMetadata {
                         run_id: &watcher_run_id,
@@ -429,7 +436,7 @@ impl WorkflowManager {
                         tracing::error!(run_id = %watcher_run_id, %interrupt_error, "failed to persist workflow interruption marker");
                     }
                 }
-                // Emit before the persist-failure return: starts always pair.
+                // Emit before the persist-failure return: every start event gets an end event
                 let elapsed = tracker.lock().elapsed_ms(&watcher_run_id);
                 log_run_ended(
                     RunEndMetadata {
@@ -752,8 +759,7 @@ fn log_run_started(
             WorkflowSource::Inline => WorkflowSourceKind::Inline,
             WorkflowSource::File(_) => WorkflowSourceKind::File,
         },
-        // Only built-in workflow names leave the machine; user script names
-        // and paths stay local.
+        // Only built-in workflow names leave the machine; user script names and paths stay local
         workflow_name: (*source == WorkflowSource::Builtin).then(|| state.name.clone()),
         agent_budget: state.agent_budget,
         max_concurrent_agents: u32::try_from(max_concurrent_agents).unwrap_or(u32::MAX),
@@ -892,6 +898,7 @@ mod tests {
             objective: "obj".into(),
             args: serde_json::json!({}),
             agent_budget: None,
+            effort: None,
             resume_run_id: None,
         }
     }
@@ -1003,6 +1010,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_reuses_immutable_launch_effort() {
+        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let script = "let meta = #{ name: \"t\", description: \"d\" };\n\
+                      await_user(\"user\", \"pause\");\n\
+                      let r = agent(\"after resume\");\n\
+                      complete(r.output);";
+        let (run_id, first_outcome) = manager
+            .launch(
+                resolve_inline(script.into()).unwrap(),
+                LaunchSpec {
+                    effort: Some(ReasoningEffort::High),
+                    ..spec()
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            first_outcome.await.unwrap(),
+            WorkflowOutcome::Paused { .. }
+        ));
+
+        let (_same_id, resumed_outcome) = manager
+            .launch(
+                resolve_inline(script.into()).unwrap(),
+                LaunchSpec {
+                    effort: None,
+                    resume_run_id: Some(run_id),
+                    ..spec()
+                },
+            )
+            .unwrap();
+        let SubagentEvent::Spawn(req) = subagent_rx.recv().await.expect("resumed spawn") else {
+            panic!("expected resumed spawn event");
+        };
+        assert_eq!(
+            req.runtime_overrides.reasoning_effort.as_deref(),
+            Some("high")
+        );
+        complete_spawn(req);
+        assert!(matches!(
+            resumed_outcome.await.unwrap(),
+            WorkflowOutcome::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn pause_eagerly_marks_user_paused() {
         let dir = tempfile::tempdir().unwrap();
         let (mut manager, _rx) = test_manager(Some(dir.path().to_path_buf()));
@@ -1013,6 +1068,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                None,
             )
             .unwrap();
         manager.tracker.lock().start_run(
@@ -1233,7 +1289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn completed_cancelled_and_interrupted_runs_are_not_resumable() {
+    async fn completed_and_interrupted_runs_are_not_resumable() {
         use xai_grok_tools::implementations::grok_build::task::types::{
             SubagentEvent, SubagentResult,
         };
@@ -1262,7 +1318,6 @@ mod tests {
         let state = manager.tracker.lock().get(&run_id).unwrap();
         for status in [
             crate::session::workflow::tracker::WorkflowRunStatus::Complete,
-            crate::session::workflow::tracker::WorkflowRunStatus::Cancelled,
             crate::session::workflow::tracker::WorkflowRunStatus::Interrupted,
         ] {
             let mut restored = state.clone();
@@ -1286,6 +1341,21 @@ mod tests {
                 "{status:?}: {err}"
             );
         }
+
+        let mut cancelled = state.clone();
+        cancelled.status = crate::session::workflow::tracker::WorkflowRunStatus::Cancelled;
+        manager.tracker = Arc::new(parking_lot::Mutex::new(WorkflowTracker::from_snapshot(
+            vec![cancelled],
+        )));
+        manager
+            .launch(
+                resolve_inline(script.into()).unwrap(),
+                LaunchSpec {
+                    resume_run_id: Some(run_id.clone()),
+                    ..spec()
+                },
+            )
+            .expect("cancelled /workflow stop runs stay resumable from the journal");
     }
 
     #[tokio::test]
@@ -1299,6 +1369,7 @@ mod tests {
                 &run_id,
                 "let meta = #{ name: \"t\", description: \"d\" };",
                 &serde_json::json!({}),
+                None,
             )
             .unwrap();
         manager.tracker.lock().start_run(
@@ -1358,6 +1429,7 @@ mod tests {
             xai_grok_tools::implementations::grok_build::task::types::ModelOverrideProvenance::Tool,
             "script model overrides are untrusted tool provenance"
         );
+        assert_eq!(req.runtime_overrides.reasoning_effort, None);
         let id = req.id.clone();
         let _ = req.result_tx.send(SubagentResult {
             success: true,
@@ -1367,6 +1439,107 @@ mod tests {
         });
         let outcome = outcome_rx.await.unwrap();
         assert!(matches!(outcome, WorkflowOutcome::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn launch_effort_applies_to_children_and_child_override_wins() {
+        use xai_grok_tools::implementations::grok_build::task::types::SubagentEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let resolved = resolve_inline(
+            "let meta = #{ name: \"t\", description: \"d\" };\n\
+             let results = parallel([\n\
+                 #{ prompt: \"inherits\" },\n\
+                 #{ prompt: \"overrides\", effort: \"LoW\" },\n\
+             ]);\n\
+             complete(results.len());"
+                .into(),
+        )
+        .unwrap();
+        let (_run_id, outcome_rx) = manager
+            .launch(
+                resolved,
+                LaunchSpec {
+                    effort: Some(ReasoningEffort::High),
+                    ..spec()
+                },
+            )
+            .unwrap();
+
+        let mut efforts = HashMap::new();
+        for _ in 0..2 {
+            let SubagentEvent::Spawn(req) = subagent_rx.recv().await.expect("spawn") else {
+                panic!("expected spawn event");
+            };
+            efforts.insert(
+                req.request.prompt.clone(),
+                req.request.runtime_overrides.reasoning_effort.clone(),
+            );
+            complete_spawn(req);
+        }
+        assert_eq!(
+            efforts.get("inherits").and_then(Option::as_deref),
+            Some("high")
+        );
+        assert_eq!(
+            efforts.get("overrides").and_then(Option::as_deref),
+            Some("low")
+        );
+        assert!(matches!(
+            outcome_rx.await.unwrap(),
+            WorkflowOutcome::Completed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn agent_rejects_invalid_effort_before_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let resolved = resolve_inline(
+            "let meta = #{ name: \"t\", description: \"d\" };\n\
+             agent(\"work\", #{ effort: \"turbo\" });"
+                .into(),
+        )
+        .unwrap();
+        let (_run_id, outcome_rx) = manager.launch(resolved, spec()).unwrap();
+
+        match outcome_rx.await.unwrap() {
+            WorkflowOutcome::Failed { error } => {
+                assert!(error.contains("invalid workflow agent effort"), "{error}");
+                assert!(error.contains("turbo"), "{error}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(
+            subagent_rx.try_recv().is_err(),
+            "invalid effort must not reach the coordinator"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_nulls_invalid_child_effort_without_spawning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut manager, mut subagent_rx) = test_manager(Some(dir.path().to_path_buf()));
+        let resolved = resolve_inline(
+            "let meta = #{ name: \"t\", description: \"d\" };\n\
+             let results = parallel([#{ prompt: \"work\", effort: \"turbo\" }]);\n\
+             complete(results);"
+                .into(),
+        )
+        .unwrap();
+        let (_run_id, outcome_rx) = manager.launch(resolved, spec()).unwrap();
+
+        match outcome_rx.await.unwrap() {
+            WorkflowOutcome::Completed { result } => {
+                assert_eq!(result, serde_json::json!([null]));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert!(
+            subagent_rx.try_recv().is_err(),
+            "invalid effort must not reach the coordinator"
+        );
     }
 
     #[tokio::test]

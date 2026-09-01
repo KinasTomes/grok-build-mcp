@@ -45,6 +45,9 @@ pub(crate) struct UploadManifest {
     pub failure_details: HashMap<String, FailureDetail>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub skip_details: HashMap<String, String>,
+    /// Names the writer for non-standard producers; absent for the live turn-upload path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<&'static str>,
 }
 impl UploadManifest {
     pub(crate) fn error(upload_method: ManifestUploadMethod) -> Self {
@@ -56,6 +59,7 @@ impl UploadManifest {
             artifacts: HashMap::new(),
             failure_details: HashMap::new(),
             skip_details: HashMap::new(),
+            source: None,
         }
     }
 }
@@ -122,14 +126,14 @@ pub(crate) fn skip_artifact(tracker: &ArtifactTracker, filename: &str, reason: &
     inner.statuses.insert(key.clone(), ArtifactStatus::Skipped);
     inner.skips.insert(key, reason.to_owned());
 }
-/// `fully_uploaded` is `true` iff no artifact has status `Failed`. `Enqueued`
-/// counts as non-failure because every writer of it has passed a real queue
-/// hand-off gate (see [`ArtifactStatus::Enqueued`]) — pre-handoff timeouts
-/// record `Failed` instead — and flagging an accepted hand-off as failure
-/// would permanently park a turn whose artifacts land moments later.
+/// `fully_uploaded` is `true` iff no artifact has status `Failed`.
+/// `Enqueued` counts as non-failure: it is only written after the upload queue accepted the artifact (see [`ArtifactStatus::Enqueued`]).
+/// Timeouts before the queue accepts record `Failed` instead.
+/// Treating an accepted artifact as failed would permanently park a turn whose artifacts land moments later.
 pub(crate) fn build_manifest(
     tracker: &ArtifactTracker,
     upload_method: ManifestUploadMethod,
+    source: Option<&'static str>,
 ) -> UploadManifest {
     let inner = tracker.lock();
     let artifacts = inner.statuses.clone();
@@ -156,6 +160,7 @@ pub(crate) fn build_manifest(
         artifacts,
         failure_details,
         skip_details,
+        source,
     }
 }
 #[derive(Clone)]
@@ -163,15 +168,17 @@ pub(crate) struct ArtifactUploadContext {
     pub(crate) gcs_config: crate::session::repo_changes::TraceExportConfig,
     pub(crate) artifact_tracker: ArtifactTracker,
 }
-pub(crate) fn resolve_upload_method(ctx: &PromptTraceContext) -> ManifestUploadMethod {
-    match &ctx.gcs_config.upload_method {
+pub(crate) fn resolve_upload_method(
+    gcs_config: &crate::session::repo_changes::TraceExportConfig,
+) -> ManifestUploadMethod {
+    match &gcs_config.upload_method {
         crate::session::repo_changes::UploadMethod::Proxy { .. } => ManifestUploadMethod::Proxy,
         crate::session::repo_changes::UploadMethod::Direct { .. } => ManifestUploadMethod::Direct,
         crate::session::repo_changes::UploadMethod::S3 { .. } => ManifestUploadMethod::S3,
     }
 }
 pub(crate) async fn write_error_manifest(ctx: &PromptTraceContext) {
-    let method = resolve_upload_method(ctx);
+    let method = resolve_upload_method(&ctx.gcs_config);
     write_upload_manifest(ctx, &UploadManifest::error(method)).await;
 }
 pub(crate) async fn write_upload_manifest(ctx: &PromptTraceContext, manifest: &UploadManifest) {
@@ -198,9 +205,7 @@ pub(crate) async fn write_upload_manifest(ctx: &PromptTraceContext, manifest: &U
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Artifact names expected by the session-trace ingest pipeline.
-    /// Artifacts recorded by the turn-end upload path (excludes
-    /// `upload_tool_definitions`, which runs earlier in the turn).
+    /// Artifacts recorded by the turn-end upload path (excludes `upload_tool_definitions`, which runs earlier in the turn).
     fn ingestion_expected_artifacts() -> Vec<&'static str> {
         vec![
             "metadata.json",
@@ -215,7 +220,7 @@ mod tests {
         for name in ingestion_expected_artifacts() {
             record_artifact(&tracker, name, ArtifactResult::Succeeded);
         }
-        build_manifest(&tracker, ManifestUploadMethod::Proxy)
+        build_manifest(&tracker, ManifestUploadMethod::Proxy, None)
     }
     #[test]
     fn manifest_covers_all_expected_artifacts() {
@@ -250,24 +255,22 @@ mod tests {
                 error: None,
             },
         );
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(!manifest.fully_uploaded);
     }
-    /// `enqueued` is the wire value the flush-bounded blocking path writes for
-    /// artifacts still uploading at manifest time; it must not read as failure.
+    /// `enqueued` is the wire value the flush-bounded blocking path writes for artifacts still uploading at manifest time.
     #[test]
     fn enqueued_status_serializes_and_keeps_fully_uploaded() {
         let tracker = new_artifact_tracker();
         record_artifact(&tracker, "metadata.json", ArtifactResult::Succeeded);
         record_artifact(&tracker, "turn_result.json", ArtifactResult::Enqueued);
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::S3);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::S3, None);
         assert!(manifest.fully_uploaded);
         let json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
         assert_eq!(json["artifacts"]["turn_result.json"], "enqueued");
         assert!(json.get("failure_details").is_none());
     }
-    /// A later terminal outcome may overwrite `enqueued` (an in-flight
-    /// upload finishing during the flush); last write wins.
+    /// A later terminal outcome may overwrite `enqueued` (an in-flight upload finishing during the flush); last write wins.
     #[test]
     fn enqueued_status_upgrades_to_terminal_outcome() {
         let tracker = new_artifact_tracker();
@@ -280,7 +283,7 @@ mod tests {
                 error: None,
             },
         );
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(!manifest.fully_uploaded);
         assert!(matches!(
             manifest.artifacts.get("turn_messages.json"),
@@ -292,7 +295,7 @@ mod tests {
         let tracker = new_artifact_tracker();
         record_artifact(&tracker, "metadata.json", ArtifactResult::Succeeded);
         skip_artifact(&tracker, "memory.tar.gz", "artifact_disabled");
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Direct);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Direct, None);
         assert!(manifest.fully_uploaded);
     }
     #[test]
@@ -300,7 +303,7 @@ mod tests {
         let tracker = new_artifact_tracker();
         skip_artifact(&tracker, "memory.tar.gz", "artifact_disabled");
         skip_artifact(&tracker, "turn_messages.json", "no_turn_messages_captured");
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(manifest.fully_uploaded);
     }
     #[test]
@@ -316,7 +319,7 @@ mod tests {
                 error: None,
             },
         );
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(!manifest.fully_uploaded);
     }
     #[test]
@@ -338,7 +341,7 @@ mod tests {
                 error: Some("HTTP 503: service unavailable"),
             },
         );
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::S3);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::S3, None);
         let json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
         assert_eq!(json["schema_version"], 3);
         assert_eq!(json["fully_uploaded"], false);
@@ -359,7 +362,7 @@ mod tests {
     fn skip_details_omitted_when_nothing_skipped() {
         let tracker = new_artifact_tracker();
         record_artifact(&tracker, "metadata.json", ArtifactResult::Succeeded);
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         let json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
         assert!(json.get("skip_details").is_none());
     }
@@ -368,14 +371,14 @@ mod tests {
         let tracker = new_artifact_tracker();
         skip_artifact(&tracker, "memory.tar.gz", "session_registry_disabled");
         record_artifact(&tracker, "memory.tar.gz", ArtifactResult::Succeeded);
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(manifest.skip_details.is_empty());
     }
     #[test]
     fn failure_details_omitted_when_all_succeed() {
         let tracker = new_artifact_tracker();
         record_artifact(&tracker, "metadata.json", ArtifactResult::Succeeded);
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         let json: serde_json::Value = serde_json::to_value(&manifest).unwrap();
         assert!(json.get("failure_details").is_none());
     }
@@ -390,7 +393,7 @@ mod tests {
                 error: None,
             },
         );
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(matches!(
             manifest.artifacts.get("memory.tar.gz"),
             Some(ArtifactStatus::Failed)
@@ -411,7 +414,7 @@ mod tests {
             },
         );
         record_artifact(&tracker, "metadata.json", ArtifactResult::Succeeded);
-        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy);
+        let manifest = build_manifest(&tracker, ManifestUploadMethod::Proxy, None);
         assert!(manifest.fully_uploaded);
         assert!(manifest.failure_details.is_empty());
     }

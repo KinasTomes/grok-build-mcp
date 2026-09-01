@@ -1,7 +1,6 @@
 //! Shell mode, edit/tool rendering, folder trust, skills, and MCP PTY coverage.
 //!
-//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this
-//! process-heavy family at four concurrent libtest workers.
+//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this process-heavy family at four concurrent libtest workers.
 
 // Shared support intentionally serves all PTY family crates.
 #[allow(dead_code, unused_imports)]
@@ -17,6 +16,8 @@ mod bash_mode_file_completion_shell_like;
 mod bash_mode_strips_redundant_session_cd_from_chrome;
 #[path = "pty_e2e/bash_mode_tab_completion_dropdown.rs"]
 mod bash_mode_tab_completion_dropdown;
+#[path = "pty_e2e/consent_gate_blocks_session_pty.rs"]
+mod consent_gate_blocks_session_pty;
 #[path = "pty_e2e/edit_collapsed_oneliner_pty.rs"]
 mod edit_collapsed_oneliner_pty;
 #[path = "pty_e2e/edit_hl_inplace_refresh_pty.rs"]

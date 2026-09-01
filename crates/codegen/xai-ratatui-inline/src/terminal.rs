@@ -40,7 +40,8 @@ struct LinkRef {
 }
 
 struct LastNamedOsc8 {
-    source_id: u32,
+    /// `None` groups consecutive unnamed same-URL wrap fragments.
+    source_id: Option<u32>,
     url: Arc<str>,
     osc8_id: u32,
 }
@@ -79,25 +80,25 @@ fn write_osc8_close<W: Write>(w: &mut W) -> io::Result<()> {
 }
 
 /// Markdown ids restart per document; OSC 8 `id=` is terminal-global.
-/// Consecutive wrap segments of the same source id+URL reuse the last emitted id.
+///
+/// Full-screen apps must set `id=` so wrap fragments group as one hyperlink
+/// (Windows Terminal hover / Ctrl+click). Consecutive spans that share a
+/// source id and URL reuse the reminted id; unnamed consecutive same-URL
+/// spans (soft-wrap of a scanned URL) do too.
 fn next_osc8_id(
     span: &LinkSpan,
     last_named: &mut Option<LastNamedOsc8>,
     next: &mut u32,
 ) -> Option<u32> {
-    let Some(source_id) = span.id else {
-        *last_named = None;
-        return None;
-    };
     if let Some(last) = last_named.as_ref()
-        && last.source_id == source_id
+        && last.source_id == span.id
         && last.url.as_ref() == span.url.as_ref()
     {
         return Some(last.osc8_id);
     }
     *next = next.saturating_add(1);
     *last_named = Some(LastNamedOsc8 {
-        source_id,
+        source_id: span.id,
         url: Arc::clone(&span.url),
         osc8_id: *next,
     });
@@ -359,7 +360,8 @@ where
     /// (so links from the previous frame are diffed away).
     ///
     /// [`LinkSpan::id`] is a source grouping key. Consecutive spans with the
-    /// same id and URL share one reminted OSC 8 `id=` starting at 1.
+    /// same id and URL share one reminted OSC 8 `id=` starting at 1. Unnamed
+    /// consecutive same-URL spans (scanned wrap fragments) share an id too.
     ///
     /// [`flush_with_links`]: Self::flush_with_links
     pub fn set_frame_links(&mut self, spans: &[LinkSpan]) {
@@ -1356,6 +1358,40 @@ impl<B: Backend> Terminal<B> {
         self.last_known_area
     }
 
+    /// Switch the viewport kind in place, keeping the backend alive.
+    ///
+    /// `Viewport::Inline` issues a cursor-position query (caller must be the
+    /// only stdin reader), and both buffers reset — follow with a full redraw.
+    pub fn set_viewport(&mut self, viewport: Viewport) -> io::Result<()> {
+        let area = match viewport {
+            Viewport::Fullscreen | Viewport::Inline(_) => {
+                Rect::from((Position::ORIGIN, self.backend.size()?))
+            }
+            Viewport::Fixed(area) => area,
+        };
+        let (viewport_area, cursor_pos) = match viewport {
+            Viewport::Fullscreen => (area, Position::ORIGIN),
+            Viewport::Inline(height) => {
+                compute_inline_size(&mut self.backend, height, area.as_size(), 0)?
+            }
+            Viewport::Fixed(area) => (area, area.as_position()),
+        };
+        let link_len = (viewport_area.width as usize) * (viewport_area.height as usize);
+        self.viewport = viewport;
+        self.viewport_area = viewport_area;
+        self.last_known_area = area;
+        self.last_known_cursor_pos = cursor_pos;
+        self.buffers = [Buffer::empty(viewport_area), Buffer::empty(viewport_area)];
+        self.current = 0;
+        for layer in self.link_ids.iter_mut() {
+            layer.clear();
+            layer.resize(link_len, 0);
+        }
+        self.link_tables[0].clear();
+        self.link_tables[1].clear();
+        Ok(())
+    }
+
     /// HACK: this is made pub
     pub fn set_viewport_area(&mut self, area: Rect) {
         self.buffers[self.current].resize(area);
@@ -1429,6 +1465,38 @@ mod inline_resize_tests {
         terminal.autoresize().unwrap();
 
         assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 80, 20));
+    }
+
+    /// `set_viewport` must match what a fresh `with_options` would compute.
+    #[test]
+    fn set_viewport_round_trips_fullscreen_and_inline() {
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(80, 24),
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .unwrap();
+        assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 80, 24));
+
+        terminal.set_viewport(Viewport::Inline(10)).unwrap();
+        let inline_area = terminal.viewport_area();
+        assert_eq!(inline_area.width, 80);
+        assert_eq!(inline_area.height, 10);
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                assert_eq!(area.height, 10);
+            })
+            .unwrap();
+
+        terminal.set_viewport(Viewport::Fullscreen).unwrap();
+        assert_eq!(terminal.viewport_area(), Rect::new(0, 0, 80, 24));
+        terminal
+            .draw(|f| {
+                assert_eq!(f.area(), Rect::new(0, 0, 80, 24));
+            })
+            .unwrap();
     }
 
     /// Growth after a shrink must expand again — the viewport tracks the live

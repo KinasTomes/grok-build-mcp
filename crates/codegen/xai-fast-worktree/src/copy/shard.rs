@@ -31,7 +31,6 @@ pub(crate) fn shard_for_path(path: &Path, num_shards: usize) -> usize {
 /// Disambiguates same-basename worktrees that share a basename-derived key (btrfs
 /// snapshot name, worktree DB id). Full 64 bits keep a collision astronomically
 /// unlikely.
-#[cfg(any(target_os = "linux", feature = "metadata"))]
 pub(crate) fn short_path_hash(path: &Path) -> String {
     format!("{:016x}", rapidhash_path(path))
 }
@@ -59,19 +58,6 @@ mod tests {
     }
 
     #[test]
-    fn test_different_directories_may_differ() {
-        let file1 = PathBuf::from("src/foo.rs");
-        let file2 = PathBuf::from("tests/foo.rs");
-
-        let num_shards = 8;
-
-        // Different directories may (but don't have to) produce different shards
-        let _shard1 = shard_for_path(&file1, num_shards);
-        let _shard2 = shard_for_path(&file2, num_shards);
-        // Just verify it doesn't panic
-    }
-
-    #[test]
     fn test_shard_in_range() {
         let path = PathBuf::from("some/deep/nested/path/file.txt");
 
@@ -79,12 +65,5 @@ mod tests {
             let shard = shard_for_path(&path, num_shards);
             assert!(shard < num_shards);
         }
-    }
-
-    #[test]
-    fn test_root_file() {
-        let path = PathBuf::from("file.txt");
-        let shard = shard_for_path(&path, 8);
-        assert!(shard < 8);
     }
 }

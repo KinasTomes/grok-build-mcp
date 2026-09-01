@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::computer::types::KillOutcome;
+use crate::computer::types::KillSource;
 use crate::computer::types::TaskKind;
 use crate::computer::types::TerminalBackend;
 use crate::registry::types::{
@@ -114,6 +115,11 @@ impl ToolBridge {
             .await
             .get::<TemplateRenderer>()
             .and_then(|r| r.tool_for_kind(kind).map(str::to_string))
+    }
+
+    /// Resolve a canonical registry ID to its enabled client-facing name.
+    pub fn tool_for_registry_id(&self, registry_id: &str) -> Option<String> {
+        self.registry.tool_name_for_registry_id(registry_id)
     }
 
     /// [`ToolKind`] for a registered tool by client-facing name, or
@@ -486,6 +492,21 @@ impl ToolBridge {
         }
     }
 
+    /// Move all running foreground commands to background instead of killing them, optionally scoped to `owner_session_id`.
+    /// Used on a mid-turn redirect (send-now) so an in-flight command is never SIGKILLed.
+    pub async fn background_foreground_commands(
+        &self,
+        owner_session_id: Option<&str>,
+    ) -> Vec<crate::computer::types::BackgroundedForeground> {
+        if let Some(terminal) = &self.terminal {
+            terminal
+                .background_foreground_commands(owner_session_id)
+                .await
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Kill all running background tasks.
     pub async fn kill_all_background_tasks(&self) {
         if let Some(terminal) = &self.terminal {
@@ -544,13 +565,22 @@ impl ToolBridge {
         let _ = self.registry.update_resource(resource).await;
     }
 
-    /// Kill any background task
+    /// See [`FinalizedToolset::update_resources_with`].
+    pub async fn update_resources_with(
+        &self,
+        seed: impl FnOnce(&mut crate::types::resources::Resources),
+    ) {
+        self.registry.update_resources_with(seed).await;
+    }
+
+    /// Kill a background task, recording who initiated the kill.
     pub async fn kill_background_task(
         &self,
         task_id: &str,
+        source: KillSource,
     ) -> Result<KillOutcome, xai_tool_runtime::ToolError> {
         if let Some(terminal) = &self.terminal {
-            Ok(terminal.kill_task(task_id).await)
+            Ok(terminal.kill_task_with_source(task_id, source).await)
         } else {
             Err(xai_tool_runtime::ToolError::invalid_arguments(format!(
                 "Missing Task Id: {task_id}"
@@ -843,6 +873,7 @@ mod tests {
             kind: Default::default(),
             block_waited: false,
             explicitly_killed: false,
+            kill_result_delivered: false,
             owner_session_id: owner.map(|s| s.to_string()),
             description: None,
             is_backgrounded: false,
@@ -885,6 +916,78 @@ mod tests {
         assert!(
             !ids.contains(&"parent-task"),
             "another session's task must NOT leak into this session: {ids:?}"
+        );
+    }
+
+    struct RecordingKillTerminal {
+        kills: std::sync::Mutex<Vec<(String, KillSource)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TerminalBackend for RecordingKillTerminal {
+        async fn run(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<TerminalRunResult, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn run_background(
+            &self,
+            _: TerminalRunRequest,
+        ) -> Result<BackgroundHandle, crate::computer::types::ComputerError> {
+            unimplemented!()
+        }
+        async fn kill_task(&self, task_id: &str) -> KillOutcome {
+            self.kill_task_with_source(task_id, KillSource::ModelTool)
+                .await
+        }
+        async fn kill_task_with_source(&self, task_id: &str, source: KillSource) -> KillOutcome {
+            self.kills
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), source));
+            KillOutcome::Killed
+        }
+        async fn get_task(&self, _: &str) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn wait_for_completion(&self, _: &str, _: Option<Duration>) -> Option<TaskSnapshot> {
+            None
+        }
+        async fn list_tasks(&self) -> Vec<TaskSnapshot> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn kill_background_task_forwards_source() {
+        let backend = Arc::new(RecordingKillTerminal {
+            kills: std::sync::Mutex::new(Vec::new()),
+        });
+        let bridge = ToolBridge {
+            registry: Arc::new(FinalizedToolset::empty_for_test()),
+            terminal: Some(backend.clone()),
+        };
+        assert_eq!(
+            bridge
+                .kill_background_task("t-ui", KillSource::ClientUi)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            bridge
+                .kill_background_task("t-td", KillSource::Teardown)
+                .await
+                .unwrap(),
+            KillOutcome::Killed
+        );
+        assert_eq!(
+            *backend.kills.lock().unwrap(),
+            vec![
+                ("t-ui".into(), KillSource::ClientUi),
+                ("t-td".into(), KillSource::Teardown),
+            ]
         );
     }
 

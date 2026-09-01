@@ -3,9 +3,10 @@ use crate::remote::DEFAULT_CONTEXT_WINDOW;
 use xai_chat_state::conversation_util::replace_or_insert_system_head;
 impl SessionActor {
     pub(super) async fn handle_set_session_model(
-        &self,
+        self: &std::sync::Arc<Self>,
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
+        is_family_switch: bool,
         apply_prompt_override: bool,
         skip_prompt_rewrite: bool,
         auto_compact_threshold_percent: u8,
@@ -117,20 +118,38 @@ impl SessionActor {
                 agent_name: Some(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
             });
+        self.emit_status_snapshot_detached();
+        let turn_in_flight = self.state.lock().await.running_task.is_some();
+        if turn_in_flight && is_family_switch {
+            tracing::warn!("Family-switch compact skipped: turn in flight");
+        }
+        if is_family_switch && !turn_in_flight && self.history_has_model_minted_items().await {
+            self.abort_and_clear_prefire().await;
+            let estimated_total_tokens = self.chat_state_handle.get_estimated_total_tokens().await;
+            let context_window = new_context_window.get();
+            let trigger_info = compaction::AutoCompactTriggerInfo {
+                tokens_used: estimated_total_tokens,
+                context_window,
+                percentage: xai_token_estimation::usage_percentage_u8(
+                    estimated_total_tokens,
+                    context_window,
+                ),
+            };
+            tracing::info!("Family-switch compact: -> {}", sampling_config.model);
+            if let Err(e) = self.run_compact_only(trigger_info, true).await {
+                tracing::error!(error = %e, "Family-switch compaction failed; switching anyway");
+            }
+        }
         Ok(model_id)
     }
     /// Handle [`SessionCommand::RebuildAgentForDefinition`].
     ///
-    /// Builds a fresh [`xai_grok_agent::Agent`] from the cached
-    /// [`crate::session::agent_rebuild::AgentRebuildSpec`] + the supplied
-    /// [`xai_grok_agent::AgentDefinition`], replaces `self.agent`,
-    /// rewrites the system message in the conversation, persists the
-    /// new prompt artifacts, and updates `active_agent_type`.
+    /// Builds a fresh [`xai_grok_agent::Agent`] from the cached [`crate::session::agent_rebuild::AgentRebuildSpec`] and the supplied definition.
+    /// Replaces `self.agent`, rewrites the system message in the conversation, persists the new prompt artifacts, and updates `active_agent_type`.
     ///
-    /// Triggered from `MvpAgent::set_session_model` only when the new
-    /// model's `agent_type` differs from the session's current
-    /// `active_agent_type` AND `turn_count == 0` (no user message has
-    /// been sent yet). Defense-in-depth: rejects if a turn is in flight.
+    /// Triggered from `MvpAgent::set_session_model` only when the new model's `agent_type` differs from the session's `active_agent_type`.
+    /// The trigger also requires `turn_count == 0` (no user message has been sent yet).
+    /// Defense-in-depth: rejects if a turn is in flight.
     pub(super) async fn handle_rebuild_agent_for_definition(
         &self,
         definition: xai_grok_agent::AgentDefinition,
@@ -171,12 +190,7 @@ impl SessionActor {
         let new_system_prompt = new_agent.system_prompt().to_string();
         let mut new_prompt_context = new_agent.prompt_context().clone();
         new_prompt_context.normalize_for_persistence();
-        if let Some(handle) = self.compaction.prefire.take_handle() {
-            handle.abort();
-            let _ = handle.await;
-            self.compaction.prefire.finish();
-        }
-        self.compaction.prefire.clear();
+        self.abort_and_clear_prefire().await;
         *self.agent.borrow_mut() = new_agent;
         *self.active_agent_type.lock() = Some(new_agent_name.clone());
         self.emit_resolved_tool_overrides();
@@ -298,14 +312,10 @@ impl SessionActor {
         );
         Ok(())
     }
-    /// Apply a client-supplied `systemPromptOverride` on session attach without
-    /// wiping user/assistant history: swap only the leading `System` message,
-    /// atomically inside the `ChatStateActor` (see
-    /// `ChatStateCommand::ReplaceSystemHead` for the serialization guarantees).
-    /// `system_prompt.txt` (not owned by the persistence actor) is saved
-    /// directly, even on a head no-op, so a previously-diverged secondary
-    /// artifact self-heals. Skipped entirely on a verbatim mirror-fork
-    /// (`preserve_inherited_system`).
+    /// Apply a client-supplied `systemPromptOverride` on attach without wiping user/assistant history: swap only the leading `System` message.
+    /// The swap happens atomically inside the `ChatStateActor` (see `ChatStateCommand::ReplaceSystemHead` for the serialization guarantees).
+    /// `system_prompt.txt` (not owned by the persistence actor) is saved directly, even on a head no-op, so a diverged secondary artifact self-heals.
+    /// Skipped entirely on a verbatim mirror-fork (`preserve_inherited_system`).
     pub(super) async fn handle_replace_system_prompt(&self, system_prompt: String) {
         if self.startup_hints.preserve_inherited_system {
             tracing::debug!(
@@ -338,5 +348,29 @@ impl SessionActor {
                 "handle_replace_system_prompt: head already matches, no-op"
             );
         }
+    }
+    /// Whether the conversation has anything a family switch must compact away.
+    async fn history_has_model_minted_items(&self) -> bool {
+        self.chat_state_handle
+            .get_conversation()
+            .await
+            .iter()
+            .any(|item| {
+                matches!(
+                    item,
+                    xai_grok_sampling_types::ConversationItem::Assistant(_)
+                        | xai_grok_sampling_types::ConversationItem::Reasoning(_)
+                        | xai_grok_sampling_types::ConversationItem::BackendToolCall(_)
+                )
+            })
+    }
+    /// Abort and join an in-flight prefire pass-1 and drop its NOTE1 cache.
+    pub(super) async fn abort_and_clear_prefire(&self) {
+        if let Some(handle) = self.compaction.prefire.take_handle() {
+            handle.abort();
+            let _ = handle.await;
+            self.compaction.prefire.finish();
+        }
+        self.compaction.prefire.clear();
     }
 }

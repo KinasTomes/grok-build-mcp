@@ -1,7 +1,6 @@
 //! Models, announcements, settings, campaigns, tips, and modal PTY coverage.
 //!
-//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this
-//! process-heavy family at four concurrent libtest workers.
+//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this process-heavy family at four concurrent libtest workers.
 
 // Shared support intentionally serves all PTY family crates.
 #[allow(dead_code, unused_imports)]
@@ -24,6 +23,8 @@ mod critical_announcement_session_banner_pty;
 mod dashboard_overlay_tab_esc_backout_and_ctrl_backslash;
 #[path = "pty_e2e/extensions_modal_copy_hints_pty.rs"]
 mod extensions_modal_copy_hints_pty;
+#[path = "pty_e2e/extensions_modal_workflows_tab_pty.rs"]
+mod extensions_modal_workflows_tab_pty;
 #[path = "pty_e2e/iterm_readline_editing.rs"]
 mod iterm_readline_editing;
 #[path = "pty_e2e/prompt_suggestion_ghost_tab_accepts.rs"]

@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use xai_grok_telemetry::startup::{AgentKind, PhaseSnapshot, StartupPhase, format_duration};
 
+use crate::app::connect_timeout::CONNECT_UI_TIMEOUT_TRY_COMMAND;
+
 use super::{ConnectAttempt, Context, EarlierAttempt, Reason, StartupFailure};
 
 const WRAP_WIDTH: usize = 76;
@@ -42,8 +44,7 @@ struct Advice {
     next_step: NextStep,
 }
 
-/// A wedged leader is only ever the earlier attempt: the fallback that renders
-/// this message never enters `LeaderConnect` itself.
+/// A wedged leader is only ever the earlier attempt: the fallback that renders this message never enters `LeaderConnect` itself.
 fn advice_for(timings: &PhaseSnapshot, attempt: ConnectAttempt) -> Advice {
     let step = timings.longest_step().map(step_advice);
     let earlier = attempt.earlier();
@@ -73,6 +74,17 @@ impl Advice {
             );
         }
         let _ = write!(explanation, " {}", self.next_step.text());
+        // Only where waiting longer can help: a wedged leader never becomes ready, so pairing this with "stop the leader" would contradict it
+        if matches!(
+            self.next_step,
+            NextStep::Retry | NextStep::CheckNetworkThenRetry
+        ) {
+            let _ = write!(
+                explanation,
+                " On a slow machine or network filesystem, a larger startup \
+                 budget can help. Set it with the command below."
+            );
+        }
         explanation
     }
 }
@@ -150,7 +162,7 @@ impl NextStep {
     /// Kept out of the prose so wrapping can never split it.
     fn command(self) -> Option<&'static str> {
         match self {
-            Self::Retry | Self::CheckNetworkThenRetry => None,
+            Self::Retry | Self::CheckNetworkThenRetry => Some(CONNECT_UI_TIMEOUT_TRY_COMMAND),
             Self::RestartSharedLeader => Some("grok leader kill"),
         }
     }
@@ -160,13 +172,13 @@ impl NextStep {
 fn step_advice(phase: StartupPhase) -> (&'static str, NextStep) {
     use NextStep::{CheckNetworkThenRetry as Network, RestartSharedLeader, Retry};
     match phase {
-        StartupPhase::LoadConfig => ("reading your local configuration", Retry),
+        StartupPhase::ConfigLoad => ("reading your local configuration", Retry),
         StartupPhase::ManagedPolicy => ("checking your organization's managed policy", Network),
         StartupPhase::Bootstrap => ("loading your account settings", Network),
-        // A disk cache read; the network fetch is the background refresh.
+        // This step reads a disk cache; the network fetch is the background refresh
         StartupPhase::ModelCatalog => ("reading the list of available models", Retry),
-        StartupPhase::SpawnWorker => ("starting the local agent", Retry),
-        // A Unix socket and a local spawn, never the network.
+        StartupPhase::WorkerSpawn => ("starting the local agent", Retry),
+        // This step touches a Unix socket and a local spawn, never the network
         StartupPhase::LeaderConnect => ("connecting to the shared leader", RestartSharedLeader),
         StartupPhase::AcpInitialize => ("waiting for the agent to respond", Retry),
         StartupPhase::EagerAuth => ("refreshing your sign-in", Network),

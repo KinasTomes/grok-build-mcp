@@ -1,7 +1,6 @@
 //! Scroll, mouse, drag-selection, folding, and viewport PTY coverage.
 //!
-//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this
-//! process-heavy family at four concurrent libtest workers.
+//! All cases are ignored for ordinary Cargo runs; Bazel opts in and caps this process-heavy family at four concurrent libtest workers.
 
 // Shared support intentionally serves all PTY family crates.
 #[allow(dead_code, unused_imports)]
@@ -12,6 +11,8 @@ mod scroll;
 #[path = "pty_e2e/scroll_anchor_holds_parked_marker_during_live_stream.rs"]
 mod scroll_anchor_holds_parked_marker_during_live_stream;
 
+#[path = "pty_e2e/agent_execute_full_output_double_click_fold_pty.rs"]
+mod agent_execute_full_output_double_click_fold_pty;
 #[path = "pty_e2e/bash_full_output_double_click_fold_pty.rs"]
 mod bash_full_output_double_click_fold_pty;
 #[path = "pty_e2e/drag_autoscroll_no_bounce_pty.rs"]
@@ -56,6 +57,8 @@ mod recap_header_not_in_selection_pty;
 mod resize_preserves_scroll_position;
 #[path = "pty_e2e/response_top_indicator_pty.rs"]
 mod response_top_indicator_pty;
+#[path = "pty_e2e/rtl_bidi_drag_copy_logical_pty.rs"]
+mod rtl_bidi_drag_copy_logical_pty;
 #[path = "pty_e2e/scroll_debug_hud_env_toggles_overlay.rs"]
 mod scroll_debug_hud_env_toggles_overlay;
 #[path = "pty_e2e/scroll_does_not_crash.rs"]

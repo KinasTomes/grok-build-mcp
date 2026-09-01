@@ -1,24 +1,22 @@
 //! TOML loading, layered merging, and `$VAR` expansion.
 //!
-//! The merged result is the **default** config; requirements layers
-//! sit on top via [`crate::validation`].
+//! The merged result is the **default** config; requirements layers sit on top via [`crate::validation`].
 
 use std::path::Path;
 
 use crate::paths::{system_config_dir, user_grok_home};
-use crate::validation::{load_requirements, load_system_requirements};
 use crate::version_overrides::{self, apply_version_overrides};
 
 /// Read and parse a TOML file WITHOUT `$VAR` expansion (empty table if absent).
 /// Shared core of [`load_toml_file`] and the hook-layer read.
 fn read_toml_file(path: &Path) -> std::io::Result<toml::Value> {
     match std::fs::read_to_string(path) {
+        Ok(s) if s.trim().is_empty() => Ok(toml::Value::Table(toml::map::Map::new())),
         Ok(s) => match toml::from_str::<toml::Value>(&s) {
             Ok(v) => Ok(v),
             Err(e) => {
-                // Built from the span, never from Display — Display echoes the
-                // offending source line, which may carry a secret. Safe to log and
-                // to return to a client.
+                // The detail is built from the span, never from Display: Display echoes the offending source line, which may carry a secret
+                // Safe to log and to return to a client
                 let detail = toml_error_detail(&s, &e);
                 tracing::error!(file = %path.display(), "config toml has syntax errors: {detail}");
                 Err(std::io::Error::other(detail))
@@ -41,11 +39,9 @@ pub fn load_toml_file(path: &Path) -> std::io::Result<toml::Value> {
     Ok(v)
 }
 
-/// A snippet-free description of a TOML parse error: `"TOML parse error at line
-/// L, column C: <what>"` (or just the message when there's no span). Never
-/// includes the offending source line — `Display` echoes it and it may carry a
-/// secret — so this is safe to log or surface to a client. Shared with the trace
-/// `config_files` artifact so the redaction rule lives in one place.
+/// A snippet-free description of a TOML parse error: `"TOML parse error at line L, column C: <what>"` (or just the message when there's no span).
+/// Never includes the offending source line (`Display` echoes it and it may carry a secret), so this is safe to log or return to a client.
+/// Shared with the trace `config_files` artifact so the redaction rule lives in one place.
 pub fn toml_error_detail(src: &str, e: &toml::de::Error) -> String {
     match e.span() {
         Some(span) => {
@@ -77,8 +73,8 @@ fn line_col(src: &str, byte: usize) -> (usize, usize) {
     (line, col)
 }
 
-/// [`load_toml_file`] plus that layer's `[[version_overrides]]`. Use for
-/// grok config files; use [`load_toml_file`] directly for unrelated TOML.
+/// [`load_toml_file`] plus that layer's `[[version_overrides]]`.
+/// Use for grok config files; use [`load_toml_file`] directly for unrelated TOML.
 pub fn load_config_file(path: &Path) -> std::io::Result<toml::Value> {
     let mut v = load_toml_file(path)?;
     apply_version_overrides_with_registered(&mut v)?;
@@ -95,17 +91,29 @@ pub const USER_CONFIG_FILENAME: &str = "config.toml";
 /// Managed config filename, shared by the loaders in this module.
 pub const MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
 
-/// Requirements (cloud-cache) filename — the sibling server-synced artifact.
+/// Requirements (cloud-cache) filename, synced from the server alongside the managed config.
 pub const REQUIREMENTS_FILENAME: &str = "requirements.toml";
+
+/// Unsigned folder-trust store (`$GROK_HOME/trusted_folders.toml`).
+pub const TRUSTED_FOLDERS_FILENAME: &str = "trusted_folders.toml";
+
+/// User-global sandbox profile definitions (`$GROK_HOME/sandbox.toml`).
+pub const SANDBOX_CONFIG_FILENAME: &str = "sandbox.toml";
+
+/// Legacy project-hook trust list (`$GROK_HOME/trusted-hook-projects`).
+/// Migrated into [`TRUSTED_FOLDERS_FILENAME`] on the next unsandboxed start.
+pub const TRUSTED_HOOK_PROJECTS_FILENAME: &str = "trusted-hook-projects";
+
+/// Plugin trust list (`$GROK_HOME/trusted-plugins`).
+pub const TRUSTED_PLUGINS_FILENAME: &str = "trusted-plugins";
 
 pub fn load_managed_config() -> std::io::Result<toml::Value> {
     load_user_config_layer(user_grok_home().as_deref(), MANAGED_CONFIG_FILENAME)
 }
 
-/// Load a user-tier config layer from `<home>/<filename>`. With no resolvable
-/// user home, returns an empty table rather than reading a cwd-relative
-/// `.grok/<filename>` (the cwd-fallback would silently promote an untrusted
-/// project `.grok` to the user tier).
+/// Load a user-tier config layer from `<home>/<filename>`.
+/// With no resolvable user home, returns an empty table rather than reading a cwd-relative `.grok/<filename>`.
+/// The cwd fallback would silently promote an untrusted project `.grok` to the user tier.
 fn load_user_config_layer(home: Option<&Path>, filename: &str) -> std::io::Result<toml::Value> {
     match home {
         Some(g) => load_config_file(&g.join(filename)),
@@ -127,8 +135,7 @@ pub fn load_system_managed_config() -> std::io::Result<toml::Value> {
 pub struct ManagedConfigLayer {
     pub value: toml::Value,
     pub path: std::path::PathBuf,
-    /// `true` for the root-owned system layer (`/etc/grok`), derived from the
-    /// load directory.
+    /// `true` for the root-owned system layer (`/etc/grok`), derived from the load directory.
     pub is_system: bool,
 }
 
@@ -166,34 +173,33 @@ pub fn managed_config_layers_at(
     layers
 }
 
-/// A hook's origin (held by `xai_grok_hooks::HookSpec::layer`). Defined here, not
-/// in `xai-grok-hooks`, since the dep direction is `xai-grok-hooks -> xai-grok-config`;
-/// this crate sets the config tiers, `File`/`Plugin` are set downstream.
+/// A hook's origin (held by `xai_grok_hooks::HookSpec::layer`).
+/// Defined here, not in `xai-grok-hooks`, since the dep direction is `xai-grok-hooks -> xai-grok-config`.
+/// This crate sets the config tiers; `File`/`Plugin` are set downstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HookProvenance {
-    /// `/etc/grok/managed_config.toml`.
+    /// `/etc/grok/managed_config.toml` (root-owned).
     SystemManaged,
-    /// `$GROK_HOME/managed_config.toml` (server-synced).
+    /// `$GROK_HOME/managed_config.toml` (server-synced, user-writable).
     Managed,
-    /// `requirements.toml` (user or system tier).
+    /// System-tier `requirements.toml` (root-owned, e.g. `/etc/grok`).
     Requirements,
+    /// `$GROK_HOME/requirements.toml` (user-writable).
+    UserRequirements,
     /// `$GROK_HOME/config.toml`.
     User,
-    /// A JSON hook file (the hooks directory, a vendor settings file, or a
-    /// configured hooks path).
+    /// A JSON hook file (the hooks directory, a vendor settings file, or a configured hooks path).
     File,
     /// A plugin-contributed hook.
     Plugin,
-    /// A tier this build doesn't recognize (e.g. a newer peer's provenance over
-    /// the wire). Forward-tolerant so an unknown value degrades to a
-    /// conservative origin instead of failing the whole `HookRegistry` decode.
+    /// A tier this build doesn't recognize (e.g. a newer peer's provenance over the wire).
+    /// Forward-tolerant so an unknown value degrades to a conservative origin instead of failing the whole `HookRegistry` decode.
     #[serde(other)]
     Unknown,
 }
 
-/// Defaults to `File` so pre-provenance wire records decode as the most
-/// conservative origin.
+/// Defaults to `File` so wire records written before provenance existed decode as the most conservative origin.
 impl Default for HookProvenance {
     fn default() -> Self {
         Self::File
@@ -201,12 +207,37 @@ impl Default for HookProvenance {
 }
 
 impl HookProvenance {
+    /// Root-owned admin policy tiers; the user cannot disable or skip their hooks.
+    /// Every disable path must consult this predicate rather than re-derive the rule from names or paths.
+    /// `$GROK_HOME` tiers (`Managed`, `UserRequirements`) never qualify: the user owns that directory and can rewrite or repoint it.
+    /// Exempting them would let any file the user edits grant itself the exemption.
+    pub fn is_managed_policy(self) -> bool {
+        matches!(self, Self::SystemManaged | Self::Requirements)
+    }
+
+    /// Authority rank for duplicate resolution: when byte-identical hooks arrive from several tiers, the highest-ranked copy keeps its provenance.
+    /// The provenance carries the no-disable rule and the pinned timeout/env; root-owned tiers outrank `$GROK_HOME` tiers.
+    /// Deliberately NOT the config-merge precedence (where user overrides managed).
+    /// Merge precedence answers "whose VALUE wins"; this answers "whose copy of one identical hook is authoritative": ownership, not recency.
+    pub fn authority_rank(self) -> u8 {
+        match self {
+            Self::SystemManaged => 6,
+            Self::Requirements => 5,
+            Self::Managed => 4,
+            Self::UserRequirements => 3,
+            Self::User => 2,
+            Self::File | Self::Plugin => 1,
+            Self::Unknown => 0,
+        }
+    }
+
     /// The snake_case wire string (matches the derived serde representation).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::SystemManaged => "system_managed",
             Self::Managed => "managed",
             Self::Requirements => "requirements",
+            Self::UserRequirements => "user_requirements",
             Self::User => "user",
             Self::File => "file",
             Self::Plugin => "plugin",
@@ -218,13 +249,14 @@ impl HookProvenance {
 impl std::str::FromStr for HookProvenance {
     type Err = std::convert::Infallible;
 
-    /// Inverse of [`HookProvenance::as_str`]. Unrecognized strings map to
-    /// [`HookProvenance::Unknown`] (forward-tolerant), so this never fails.
+    /// Inverse of [`HookProvenance::as_str`].
+    /// Unrecognized strings map to [`HookProvenance::Unknown`] (forward-tolerant), so this never fails.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "system_managed" => Self::SystemManaged,
             "managed" => Self::Managed,
             "requirements" => Self::Requirements,
+            "user_requirements" => Self::UserRequirements,
             "user" => Self::User,
             "file" => Self::File,
             "plugin" => Self::Plugin,
@@ -233,8 +265,7 @@ impl std::str::FromStr for HookProvenance {
     }
 }
 
-/// One config layer's `hooks` subtree (read without `$VAR` expansion) plus its
-/// provenance.
+/// One config layer's `hooks` subtree (read without `$VAR` expansion) plus its provenance.
 #[derive(Debug, Clone)]
 pub struct HookConfigLayer {
     provenance: HookProvenance,
@@ -244,8 +275,8 @@ pub struct HookConfigLayer {
 }
 
 impl HookConfigLayer {
-    /// Construct a layer directly (in-memory config and tests); the synthesized
-    /// `path` mirrors `source_name`. The normal path is [`hook_config_layers`].
+    /// Construct a layer directly (in-memory config and tests); the synthesized `path` mirrors `source_name`.
+    /// Real layers come from [`hook_config_layers`].
     pub fn new(
         provenance: HookProvenance,
         source_name: impl Into<String>,
@@ -265,8 +296,7 @@ impl HookConfigLayer {
         self.provenance
     }
 
-    /// A stable label for this layer (e.g. `"managed"`, `"requirements/user"`),
-    /// used to prefix hook names for display and dedup.
+    /// A stable label for this layer (e.g. `"managed"`, `"requirements/user"`), used to prefix hook names for display and dedup.
     pub fn source_name(&self) -> &str {
         &self.source_name
     }
@@ -282,22 +312,47 @@ impl HookConfigLayer {
     }
 }
 
-/// All config-layer `hooks` blocks, highest authority first (matching
-/// [`effective_config_base`]). Read WITHOUT env-expansion and never merged (hooks
-/// combine additively downstream); absent/unparsable layers are skipped with a
-/// warning so one bad layer can't drop the others. macOS MDM is excluded (not a
-/// TOML file; MDM hooks belong to the enforcement work).
+/// All config-layer `hooks` blocks, highest authority first (matching [`effective_config_base`]).
+/// Read WITHOUT env-expansion and never merged (hooks combine additively downstream).
+/// Absent or unparsable layers are skipped with a warning so one bad layer can't drop the others.
+/// macOS MDM is excluded (not a TOML file).
 pub fn hook_config_layers() -> Vec<HookConfigLayer> {
     hook_config_layers_at(system_config_dir().as_deref(), user_grok_home().as_deref())
 }
+
+/// Warn when a policy-tier hooks file is a symlink or not root-owned; the no-disable exemption assumes admin ownership of the system dir.
+#[cfg(unix)]
+fn warn_unless_root_owned(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => tracing::warn!(
+            path = %path.display(),
+            "policy-tier hooks file is a symlink; its hooks cannot be disabled — ensure the target is admin-controlled"
+        ),
+        Ok(meta) if meta.uid() != 0 => tracing::warn!(
+            path = %path.display(),
+            uid = meta.uid(),
+            "policy-tier hooks file is not root-owned; its hooks cannot be disabled — enforcement assumes admin ownership"
+        ),
+        // Root-owned but group/world-writable is the sneakier misconfig: any local user can edit the "non-disableable" policy
+        Ok(meta) if meta.mode() & 0o022 != 0 => tracing::warn!(
+            path = %path.display(),
+            mode = format!("{:o}", meta.mode() & 0o777),
+            "policy-tier hooks file is group- or world-writable; its hooks cannot be disabled — restrict write access to root"
+        ),
+        _ => {}
+    }
+}
+
+#[cfg(not(unix))]
+fn warn_unless_root_owned(_path: &Path) {}
 
 /// [`hook_config_layers`] with explicit directories, for tests.
 pub fn hook_config_layers_at(
     system_dir: Option<&Path>,
     user_home: Option<&Path>,
 ) -> Vec<HookConfigLayer> {
-    /// One candidate config-hook layer: which directory + filename to read, and
-    /// the provenance/label to stamp on hooks found there.
+    /// One candidate config-hook layer: which directory and filename to read, and the provenance/label to stamp on hooks found there.
     struct LayerSpec<'a> {
         dir: Option<&'a Path>,
         filename: &'a str,
@@ -305,10 +360,9 @@ pub fn hook_config_layers_at(
         source_name: &'a str,
     }
 
-    // Highest config authority first, matching `effective_config_base` precedence
-    // (requirements > user > managed > system_managed; user overrides managed in
-    // this model). Order only affects which label a byte-identical duplicate keeps
-    // under first-wins dedup; every distinct hook runs regardless.
+    // Highest config authority first, matching `effective_config_base` precedence (requirements > user > managed > system_managed)
+    // User overrides managed in this model
+    // Byte-identical duplicates resolve by `HookProvenance::authority_rank` regardless of this order; every distinct hook runs regardless
     let specs = [
         LayerSpec {
             dir: system_dir,
@@ -319,7 +373,7 @@ pub fn hook_config_layers_at(
         LayerSpec {
             dir: user_home,
             filename: REQUIREMENTS_FILENAME,
-            provenance: HookProvenance::Requirements,
+            provenance: HookProvenance::UserRequirements,
             source_name: "requirements/user",
         },
         LayerSpec {
@@ -356,8 +410,12 @@ pub fn hook_config_layers_at(
         if !path.is_file() {
             continue;
         }
-        // No `$VAR` expansion: a literal `${VAR}` must reach the hook runner, which
-        // does the single expansion (expanding here would double-expand).
+        // The no-disable exemption rests on OS ownership; a misconfigured system dir would silently create non-disableable hooks, so make it loud
+        // Classification is unchanged (a root-owned deployment is the documented requirement, not something we can verify portably)
+        if provenance.is_managed_policy() {
+            warn_unless_root_owned(&path);
+        }
+        // No `$VAR` expansion: a literal `${VAR}` must reach the hook runner, which does the single expansion (expanding here would double-expand)
         let mut value = match read_toml_file(&path) {
             Ok(v) => v,
             Err(e) => {
@@ -365,8 +423,7 @@ pub fn hook_config_layers_at(
                 continue;
             }
         };
-        // Apply `[[version_overrides]]` (parity with `load_config_file`); deep-merge
-        // only, no `$VAR` expansion, so the raw-read invariant holds.
+        // Apply `[[version_overrides]]` (parity with `load_config_file`); deep-merge only, no `$VAR` expansion, so the layer stays unexpanded
         if let Err(e) = apply_version_overrides_with_registered(&mut value) {
             tracing::warn!(path = %path.display(), error = %e, "skipping config layer whose version_overrides failed to apply");
             continue;
@@ -388,260 +445,58 @@ pub fn hook_config_layers_at(
     layers
 }
 
-/// Layers lowest→highest priority. `[[campaigns]]` taken off each layer at load.
-#[derive(Clone)]
-pub struct ConfigLayers {
-    pub system_managed: toml::Value,
-    pub managed: toml::Value,
-    pub user: toml::Value,
-    pub user_requirements: Option<toml::Value>,
-    pub system_requirements: Option<toml::Value>,
-    /// macOS MDM requirements; highest requirements tier when present.
-    pub mdm_requirements: Option<toml::Value>,
-    pub campaigns: crate::campaigns::CampaignOverrides,
-}
-
-impl Default for ConfigLayers {
-    fn default() -> Self {
-        Self {
-            system_managed: toml::Value::Table(Default::default()),
-            managed: toml::Value::Table(Default::default()),
-            user: toml::Value::Table(Default::default()),
-            user_requirements: None,
-            system_requirements: None,
-            mdm_requirements: None,
-            campaigns: crate::campaigns::CampaignOverrides::default(),
-        }
-    }
-}
-
-impl ConfigLayers {
-    pub fn load() -> std::io::Result<Self> {
-        use crate::campaigns::{CampaignOverrides, take_campaign_entries};
-
-        let mut system_managed = load_system_managed_config()?;
-        let system_managed_campaigns = take_campaign_entries(&mut system_managed, "system_managed");
-
-        let mut managed = load_managed_config()?;
-        let managed_campaigns = take_campaign_entries(&mut managed, "managed");
-
-        let mut user = load_from_disk()?;
-        let user_campaigns = take_campaign_entries(&mut user, "user");
-
-        let mut user_requirements = load_requirements();
-        let mut system_requirements = load_system_requirements();
-        let mut mdm_requirements = crate::validation::mdm_requirements_value();
-
-        // Highest-authority requirements tier first: `merge_campaign_entries` is
-        // first-id-wins, so a duplicate campaign id must resolve mdm > system >
-        // user — matching the layer precedence in `effective_config_base` (where
-        // mdm is merged last/highest).
-        let mut requirements_campaigns = Vec::new();
-        if let Some(ref mut req) = mdm_requirements {
-            requirements_campaigns.extend(take_campaign_entries(req, "requirements"));
-        }
-        if let Some(ref mut req) = system_requirements {
-            requirements_campaigns.extend(take_campaign_entries(req, "requirements"));
-        }
-        if let Some(ref mut req) = user_requirements {
-            requirements_campaigns.extend(take_campaign_entries(req, "requirements"));
-        }
-
-        Ok(Self {
-            system_managed,
-            managed,
-            user,
-            user_requirements,
-            system_requirements,
-            mdm_requirements,
-            campaigns: CampaignOverrides {
-                requirements: requirements_campaigns,
-                user: user_campaigns,
-                managed: managed_campaigns,
-                system_managed: system_managed_campaigns,
-            },
-        })
-    }
-
-    /// Layer merge only (no campaign overlay).
-    pub fn effective_config_base(&self) -> toml::Value {
-        let mut merged = self.system_managed.clone();
-        deep_merge_toml(&mut merged, &self.managed);
-        deep_merge_toml(&mut merged, &self.user);
-        if let Some(req) = &self.user_requirements {
-            deep_merge_toml(&mut merged, req);
-        }
-        if let Some(sys_req) = &self.system_requirements {
-            deep_merge_toml(&mut merged, sys_req);
-        }
-        if let Some(mdm_req) = &self.mdm_requirements {
-            deep_merge_toml(&mut merged, mdm_req);
-        }
-        merged
-    }
-
-    /// Campaign source slices in priority order (first id wins):
-    /// requirements > remote > user > managed > system_managed. Single source of
-    /// truth for the precedence; both this crate and the shell resolver consume it.
-    pub fn campaign_source_slices<'a>(
-        &'a self,
-        remote_campaigns: &'a [crate::campaigns::CampaignEntry],
-    ) -> [&'a [crate::campaigns::CampaignEntry]; 5] {
-        [
-            &self.campaigns.requirements,
-            remote_campaigns,
-            &self.campaigns.user,
-            &self.campaigns.managed,
-            &self.campaigns.system_managed,
-        ]
-    }
-
-    /// Active campaigns against `base`: kill switch → priority merge (first-id-wins)
-    /// → drop dismissed. The single place disk campaign resolution lives; the shell
-    /// wraps this with the `GROK_CAMPAIGNS_OVERRIDE` env layer.
-    pub fn resolve_campaigns(
-        &self,
-        base: &toml::Value,
-        remote_campaigns: &[crate::campaigns::CampaignEntry],
-        dismissed_ids: &std::collections::HashSet<String>,
-    ) -> Vec<crate::campaigns::CampaignEntry> {
-        if campaigns_application_disabled(base) {
-            return Vec::new();
-        }
-        let merged = crate::campaigns::merge_campaign_entries(
-            &self.campaign_source_slices(remote_campaigns),
-        );
-        crate::campaigns::filter_active_campaigns(merged, dismissed_ids)
-    }
-
-    /// Re-merge the requirements layers so an admin's `requirements.toml` always
-    /// wins over a campaign overlay, regardless of the campaign's source layer.
-    /// Campaigns are full-power (any field), so this is the structural guarantee
-    /// that a lower-trust layer's campaign can't override an admin-set field.
-    fn reapply_requirements(&self, merged: &mut toml::Value) {
-        for req in [
-            &self.user_requirements,
-            &self.system_requirements,
-            &self.mdm_requirements,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            deep_merge_toml(merged, req);
-        }
-    }
-
-    /// Apply active campaign patches onto `merged`, then restore requirements
-    /// precedence. The single overlay step shared by this crate and the shell.
-    pub fn apply_campaign_overrides(
-        &self,
-        merged: &mut toml::Value,
-        active: &[crate::campaigns::CampaignEntry],
-    ) {
-        crate::campaigns::apply_active_campaign_patches(merged, active);
-        self.reapply_requirements(merged);
-    }
-
-    /// Layer merge + disk/remote campaign overlay, honoring the kill switch. The
-    /// shell's `load_effective_config` is the remote/override-aware path; this is
-    /// used by `effective_config_disk_only` and tests.
-    pub fn effective_config_with_campaigns(
-        &self,
-        remote_campaigns: &[crate::campaigns::CampaignEntry],
-        dismissed_ids: &std::collections::HashSet<String>,
-    ) -> toml::Value {
-        let mut merged = self.effective_config_base();
-        let active = self.resolve_campaigns(&merged, remote_campaigns, dismissed_ids);
-        self.apply_campaign_overrides(&mut merged, &active);
-        merged
-    }
-
-    /// Disk campaigns + on-disk dismiss (`campaigns_state.json`); **no remote, no
-    /// env override**. Named to make the divergence from the shell's remote-aware
-    /// `load_effective_config` explicit at every call site.
-    pub fn effective_config_disk_only(&self) -> toml::Value {
-        self.effective_config_with_campaigns(&[], &load_dismissed_ids_from_home())
-    }
-
-    pub fn has_managed(&self) -> bool {
-        self.managed.as_table().is_some_and(|t| !t.is_empty())
-            || self
-                .system_managed
-                .as_table()
-                .is_some_and(|t| !t.is_empty())
-    }
-
-    pub fn has_system_managed(&self) -> bool {
-        self.system_managed
-            .as_table()
-            .is_some_and(|t| !t.is_empty())
-    }
-}
-
-/// `GROK_CAMPAIGNS=0` or `[features] campaigns = false` on pre-campaign base.
-pub fn campaigns_application_disabled(base_effective: &toml::Value) -> bool {
-    if crate::env_bool("GROK_CAMPAIGNS") == Some(false) {
-        return true;
-    }
-    base_effective
-        .get("features")
-        .and_then(|f| f.get("campaigns"))
-        .and_then(|c| c.as_bool())
-        == Some(false)
-}
-
-/// Disk layers only (no remote, no env override). Prefer the shell loader
-/// (`xai_grok_shell::util::config::load_effective_config`) when remote campaigns
-/// or `GROK_CAMPAIGNS_OVERRIDE` must be honored. The name mirrors the
-/// [`ConfigLayers::effective_config_disk_only`] method so the divergence from the
-/// remote-aware loader is un-ignorable at every call site.
-pub fn load_effective_config_disk_only() -> std::io::Result<toml::Value> {
-    Ok(ConfigLayers::load()?.effective_config_disk_only())
-}
-
-/// On-disk campaign dismiss state. Single source of truth for the file's name,
-/// location, and JSON shape — the shell's writer reuses these so the read and
-/// write sides can't drift.
-pub const CAMPAIGNS_STATE_FILE: &str = "campaigns_state.json";
-
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct CampaignsState {
-    #[serde(default)]
-    pub dismissed_ids: Vec<String>,
-}
-
-/// Path to `$GROK_HOME/campaigns_state.json` under `home`.
-pub fn campaigns_state_path(home: &std::path::Path) -> std::path::PathBuf {
-    home.join(CAMPAIGNS_STATE_FILE)
-}
-
-/// Fail-open dismissed ids from `$GROK_HOME/campaigns_state.json`.
-pub fn load_dismissed_ids_from_home() -> std::collections::HashSet<String> {
-    let Some(home) = crate::user_grok_home() else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(contents) = std::fs::read_to_string(campaigns_state_path(&home)) else {
-        return std::collections::HashSet::new();
-    };
-    serde_json::from_str::<CampaignsState>(&contents)
-        .map(|s| s.dismissed_ids.into_iter().collect())
-        .unwrap_or_default()
-}
-
-/// Applies matching `[[version_overrides]]` patches against the running
-/// CLI version; strips the section either way. If the installed version
-/// can't be parsed (broken `GROK_TEST_VERSION` in dev), silently strips
-/// without applying — keeps the CLI usable on a bad dev override.
+/// Applies matching `[[version_overrides]]` patches against the running CLI version; strips the section either way.
+/// If the installed version can't be parsed (broken `GROK_TEST_VERSION` in dev), it silently strips without applying, keeping the CLI usable.
 pub fn apply_version_overrides_with_registered(value: &mut toml::Value) -> std::io::Result<()> {
     match xai_grok_version::installed_semver() {
         Ok(version) => apply_version_overrides(value, &version)
-            .map_err(|e| std::io::Error::other(e.to_string())),
+            .map_err(|e| std::io::Error::other(e.redacted())),
         Err(_) => {
             if let Some(table) = value.as_table_mut() {
                 table.remove(version_overrides::VERSION_OVERRIDES_KEY);
             }
             Ok(())
         }
+    }
+}
+
+/// Normalize a single config layer in place, before it is merged with the others.
+///
+/// Currently: couple `[toolset.web_search]`'s mutually-exclusive `allowed_domains` and `excluded_domains`.
+/// If exactly one is set (non-empty), clear the other to `[]`, so the two keys travel together.
+/// `deep_merge_toml` then replaces the whole policy from the winning layer instead of mixing keys across layers.
+/// Both-set (a user error) and both-unset are left alone; the both-set case is handled downstream where the section is read.
+///
+/// This runs on every input of the merge, not only the disk layers.
+/// Campaign and version-override patches overlay *after* the layer merge, so they are normalized too, in `apply_patches`.
+pub(crate) fn normalize_config_layer(layer: &mut toml::Value) {
+    let Some(web_search) = layer
+        .as_table_mut()
+        .and_then(|t| t.get_mut("toolset"))
+        .and_then(|t| t.as_table_mut())
+        .and_then(|t| t.get_mut("web_search"))
+        .and_then(|v| v.as_table_mut())
+    else {
+        return;
+    };
+    let non_empty = |table: &toml::value::Table, key: &str| {
+        table
+            .get(key)
+            .and_then(toml::Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    };
+    let allowed = non_empty(web_search, "allowed_domains");
+    let excluded = non_empty(web_search, "excluded_domains");
+    if allowed && !excluded {
+        web_search.insert(
+            "excluded_domains".to_string(),
+            toml::Value::Array(Vec::new()),
+        );
+    } else if excluded && !allowed {
+        web_search.insert(
+            "allowed_domains".to_string(),
+            toml::Value::Array(Vec::new()),
+        );
     }
 }
 
@@ -732,9 +587,25 @@ mod tests {
         assert_eq!(cmd, "${HOME}/u.sh");
     }
 
+    /// The user-writable `$GROK_HOME/requirements.toml` stamps `UserRequirements`, never the exempt `Requirements`.
+    /// A file the user owns cannot grant itself the no-disable exemption.
+    #[test]
+    fn user_requirements_layer_is_not_managed_policy() {
+        let user_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_home.path().join("requirements.toml"),
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"x.sh\"\n",
+        )
+        .unwrap();
+        let layers = hook_config_layers_at(None, Some(user_home.path()));
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].provenance(), HookProvenance::UserRequirements);
+        assert_eq!(layers[0].source_name(), "requirements/user");
+        assert!(!layers[0].provenance().is_managed_policy());
+    }
+
     #[test]
     fn hook_config_layers_bad_user_layer_does_not_drop_managed() {
-        // A broken user config.toml must not drop the admin managed layer.
         let home = tempfile::tempdir().unwrap();
         write(home.path(), "config.toml", "this is = = not valid toml");
         write(
@@ -747,94 +618,7 @@ mod tests {
         assert_eq!(names, vec!["managed"]);
     }
 
-    #[test]
-    fn full_layer_precedence_requirements_over_config_over_managed() {
-        let system_managed: toml::Value =
-            toml::from_str("[telemetry]\nmode = \"system_managed_value\"\n").unwrap();
-        let managed: toml::Value =
-            toml::from_str("[telemetry]\nmode = \"managed_value\"\n").unwrap();
-        let user: toml::Value = toml::from_str("[telemetry]\nmode = \"user_value\"\n").unwrap();
-        let user_requirements: toml::Value =
-            toml::from_str("[telemetry]\nmode = \"user_requirements_value\"\n").unwrap();
-        let system_requirements: toml::Value =
-            toml::from_str("[telemetry]\nmode = \"system_requirements_value\"\n").unwrap();
-
-        let mut merged = system_managed;
-        deep_merge_toml(&mut merged, &managed);
-        deep_merge_toml(&mut merged, &user);
-        deep_merge_toml(&mut merged, &user_requirements);
-        deep_merge_toml(&mut merged, &system_requirements);
-
-        assert_eq!(
-            merged["telemetry"]["mode"].as_str(),
-            Some("system_requirements_value")
-        );
-    }
-
-    #[test]
-    fn effective_config_mdm_requirements_win_over_system_and_user() {
-        // MDM is merged last, so an admin-forced value clamps the effective
-        // config over both the user config and the system requirements layer.
-        let layers = ConfigLayers {
-            user: toml::from_str("[features]\nweb_fetch = true\n").unwrap(),
-            system_requirements: Some(toml::from_str("[features]\nweb_fetch = true\n").unwrap()),
-            mdm_requirements: Some(toml::from_str("[features]\nweb_fetch = false\n").unwrap()),
-            ..Default::default()
-        };
-        assert_eq!(
-            layers.effective_config_disk_only()["features"]["web_fetch"].as_bool(),
-            Some(false),
-        );
-    }
-
-    #[test]
-    fn full_precedence_holds_when_values_come_from_version_overrides() {
-        let cli_version = semver::Version::parse("1.8.0").unwrap();
-
-        let mut managed: toml::Value = toml::from_str(
-            r#"
-            [[version_overrides]]
-            minimum_version = "1.0.0"
-            [version_overrides.telemetry]
-            mode = "managed_versioned"
-            "#,
-        )
-        .unwrap();
-        let mut user: toml::Value = toml::from_str(
-            r#"
-            [[version_overrides]]
-            minimum_version = "1.0.0"
-            [version_overrides.telemetry]
-            mode = "user_versioned"
-            "#,
-        )
-        .unwrap();
-        let mut requirements: toml::Value = toml::from_str(
-            r#"
-            [[version_overrides]]
-            minimum_version = "1.0.0"
-            [version_overrides.telemetry]
-            mode = "requirements_versioned"
-            "#,
-        )
-        .unwrap();
-
-        apply_version_overrides(&mut managed, &cli_version).unwrap();
-        apply_version_overrides(&mut user, &cli_version).unwrap();
-        apply_version_overrides(&mut requirements, &cli_version).unwrap();
-
-        let mut merged = managed;
-        deep_merge_toml(&mut merged, &user);
-        deep_merge_toml(&mut merged, &requirements);
-
-        assert_eq!(
-            merged["telemetry"]["mode"].as_str(),
-            Some("requirements_versioned")
-        );
-    }
-
-    /// Direct contract for `deep_merge_toml`: nested tables merge (siblings
-    /// preserved), arrays replace (not concatenate), missing keys insert.
+    /// Direct contract for `deep_merge_toml`: nested tables merge (siblings preserved), arrays replace (not concatenate), missing keys insert.
     #[test]
     fn deep_merge_toml_table_merge_array_replace_and_insert() {
         let mut base: toml::Value = toml::from_str(
@@ -882,6 +666,109 @@ mod tests {
         assert_eq!(base["brand_new"]["x"].as_integer(), Some(1));
     }
 
+    fn ws_layer(body: &str) -> toml::Value {
+        toml::from_str(&format!("[toolset.web_search]\n{body}\n")).unwrap()
+    }
+
+    fn ws_array(v: &toml::Value, key: &str) -> Option<Vec<String>> {
+        v.get("toolset")?
+            .get("web_search")?
+            .get(key)?
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|d| d.as_str().map(str::to_owned))
+                    .collect()
+            })
+    }
+
+    #[test]
+    fn normalize_sets_the_absent_sibling_to_empty() {
+        let mut allow = ws_layer(r#"allowed_domains = ["a.com"]"#);
+        normalize_config_layer(&mut allow);
+        assert_eq!(
+            ws_array(&allow, "allowed_domains"),
+            Some(vec!["a.com".into()])
+        );
+        assert_eq!(ws_array(&allow, "excluded_domains"), Some(vec![]));
+
+        let mut block = ws_layer(r#"excluded_domains = ["b.com"]"#);
+        normalize_config_layer(&mut block);
+        assert_eq!(
+            ws_array(&block, "excluded_domains"),
+            Some(vec!["b.com".into()])
+        );
+        assert_eq!(ws_array(&block, "allowed_domains"), Some(vec![]));
+    }
+
+    #[test]
+    fn normalize_leaves_both_set_and_both_unset_untouched() {
+        let mut both = ws_layer("allowed_domains = [\"a.com\"]\nexcluded_domains = [\"b.com\"]");
+        normalize_config_layer(&mut both);
+        assert_eq!(
+            ws_array(&both, "allowed_domains"),
+            Some(vec!["a.com".into()])
+        );
+        assert_eq!(
+            ws_array(&both, "excluded_domains"),
+            Some(vec!["b.com".into()])
+        );
+
+        let mut none: toml::Value = toml::from_str("[toolset.web_search]\n").unwrap();
+        normalize_config_layer(&mut none);
+        assert_eq!(ws_array(&none, "allowed_domains"), None);
+        assert_eq!(ws_array(&none, "excluded_domains"), None);
+    }
+
+    /// After per-layer normalization, a plain `deep_merge_toml` lets a higher layer's blocklist beat a lower layer's allowlist atomically.
+    #[test]
+    fn normalized_layers_deep_merge_atomically() {
+        let mut lower = ws_layer(r#"allowed_domains = ["github.com"]"#);
+        let mut higher = ws_layer(r#"excluded_domains = ["evil.com"]"#);
+        normalize_config_layer(&mut lower);
+        normalize_config_layer(&mut higher);
+
+        // higher wins in a deep merge
+        let mut merged = lower;
+        deep_merge_toml(&mut merged, &higher);
+
+        assert_eq!(
+            ws_array(&merged, "excluded_domains"),
+            Some(vec!["evil.com".into()])
+        );
+        assert_eq!(
+            ws_array(&merged, "allowed_domains"),
+            Some(vec![]),
+            "lower layer's allowlist must be cleared, not merged in"
+        );
+    }
+
+    /// Campaign and version-override patches overlay after the layer merge, so they need the same normalization.
+    /// A campaign that flips an allowlist to a blocklist must replace the policy, not leave both keys set.
+    #[test]
+    fn overlay_patches_are_normalized_before_merge() {
+        let mut merged = ws_layer(r#"allowed_domains = ["github.com"]"#);
+        normalize_config_layer(&mut merged);
+
+        let patch: toml::Table =
+            toml::from_str("[toolset.web_search]\nexcluded_domains = [\"evil.com\"]\n").unwrap();
+        crate::config_override::apply_patches(
+            &mut merged,
+            std::iter::once(patch),
+            crate::config_override::PATCH_STRIP_KEYS,
+        );
+
+        assert_eq!(
+            ws_array(&merged, "excluded_domains"),
+            Some(vec!["evil.com".into()])
+        );
+        assert_eq!(
+            ws_array(&merged, "allowed_domains"),
+            Some(vec![]),
+            "the campaign's blocklist must replace the underlying allowlist"
+        );
+    }
+
     #[test]
     fn user_version_overrides_dont_escape_their_layer() {
         let cli_version = semver::Version::parse("1.8.0").unwrap();
@@ -912,10 +799,19 @@ mod tests {
 
     #[test]
     fn load_user_config_layer_is_empty_without_user_home() {
-        // No resolvable user home: no user layer, and crucially no
-        // cwd-relative .grok read.
+        // No resolvable user home: no user layer, and no cwd-relative .grok read
         let v = load_user_config_layer(None, "config.toml").unwrap();
         assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
+    }
+
+    #[test]
+    fn load_user_config_layer_treats_empty_file_as_empty_table() {
+        let dir = std::env::temp_dir().join(format!("grok-load-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), b"").unwrap();
+        let v = load_user_config_layer(Some(&dir), "config.toml").unwrap();
+        assert_eq!(v.as_table().map(|t| t.is_empty()), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -932,8 +828,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The returned error keeps the parser's kind + location but never the source
-    /// snippet, which can carry a secret and would reach a client caller.
+    /// The returned error keeps the parser's kind and location but never the source snippet, which can carry a secret and would reach clients.
     #[test]
     fn parse_error_keeps_kind_but_not_snippet() {
         let dir = std::env::temp_dir().join(format!("grok-toml-leak-{}", std::process::id()));
@@ -961,31 +856,5 @@ mod tests {
             "leaked the source snippet/caret: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// `GROK_CAMPAIGNS=0` disables campaign application regardless of config.
-    /// `GROK_CAMPAIGNS` is process-global, so this test serializes itself with a
-    /// module-local mutex and save/restores the prior value. (This crate has no
-    /// `serial_test` dev-dep and no other test reads this var, so a local guard
-    /// is sufficient.)
-    #[test]
-    fn kill_switch_env_var_disables() {
-        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
-        let prior = std::env::var_os("GROK_CAMPAIGNS");
-        let empty = toml::Value::Table(Default::default());
-
-        // SAFETY: ENV_GUARD serializes this against itself; no other test in the
-        // crate mutates or reads GROK_CAMPAIGNS concurrently.
-        unsafe { std::env::set_var("GROK_CAMPAIGNS", "0") };
-        assert!(campaigns_application_disabled(&empty));
-
-        unsafe { std::env::remove_var("GROK_CAMPAIGNS") };
-        assert!(!campaigns_application_disabled(&empty));
-
-        match prior {
-            Some(v) => unsafe { std::env::set_var("GROK_CAMPAIGNS", v) },
-            None => unsafe { std::env::remove_var("GROK_CAMPAIGNS") },
-        }
     }
 }

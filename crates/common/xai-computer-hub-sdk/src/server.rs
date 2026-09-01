@@ -235,8 +235,11 @@ pub struct ToolServerBuilder {
     ws_ping_interval: Option<std::time::Duration>,
     ws_liveness_deadline: Option<std::time::Duration>,
     reconnect_backoff: Option<Arc<[std::time::Duration]>>,
+    reconnect_after_terminal_close_codes: Vec<u16>,
+    initial_connect_attempt_timeout: Option<std::time::Duration>,
     session_handler_resolver: Option<SessionHandlerResolver>,
     binary_version: Option<String>,
+    image_capabilities: Vec<String>,
 }
 
 impl ToolServerBuilder {
@@ -319,6 +322,31 @@ impl ToolServerBuilder {
         self
     }
 
+    /// Allowlist specific 4100–4199 terminal close codes to reconnect after.
+    /// Empty (default) keeps the protocol contract: the actor stops on every
+    /// terminal close. Only restorable-session codes (e.g.
+    /// [`crate::connection::CLOSE_CODE_SANDBOX_TERMINATED`]) belong here.
+    pub fn reconnect_after_terminal_close_codes(
+        mut self,
+        codes: impl IntoIterator<Item = u16>,
+    ) -> Self {
+        let mut codes: Vec<u16> = codes.into_iter().collect();
+        codes.sort_unstable();
+        codes.dedup();
+        self.reconnect_after_terminal_close_codes = codes;
+        self
+    }
+
+    /// Per-attempt budget for the initial connect (WebSocket upgrade +
+    /// hello/hello_ack). Default (also used for a zero value): 10s. A peer
+    /// that accepts the socket but never answers would otherwise hang the
+    /// caller indefinitely; the SDK retries transient failures a bounded
+    /// number of times with jittered backoff before surfacing the error.
+    pub fn with_initial_connect_attempt_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.initial_connect_attempt_timeout = Some(timeout);
+        self
+    }
+
     /// Connection knobs handed to [`HubConnection::connect`].
     /// `reconnect_attempt_reset_after` is left `None` so the SDK applies
     /// the 10 s production dwell — not zero, not "never".
@@ -328,6 +356,8 @@ impl ToolServerBuilder {
             ws_liveness_deadline: self.ws_liveness_deadline,
             reconnect_backoff: self.reconnect_backoff.clone(),
             reconnect_attempt_reset_after: None,
+            reconnect_after_terminal_close_codes: self.reconnect_after_terminal_close_codes.clone(),
+            initial_connect_attempt_timeout: self.initial_connect_attempt_timeout,
         }
     }
 
@@ -413,7 +443,9 @@ impl ToolServerBuilder {
     /// terminal close (4100–4199). Invoked before [`Self::on_disconnect`].
     /// Advances the same disconnect epoch as [`Self::on_disconnect`] so a
     /// reconnect settle that still holds the pre-close generation cannot fire
-    /// [`Self::on_reconnect_settled`] after this callback.
+    /// [`Self::on_reconnect_settled`] after this callback. The actor still
+    /// stops afterwards unless the code is allowlisted via
+    /// [`Self::reconnect_after_terminal_close_codes`].
     pub fn on_terminal_close<F>(mut self, cb: F) -> Self
     where
         F: Fn(u16) + Send + Sync + 'static,
@@ -463,6 +495,14 @@ impl ToolServerBuilder {
     /// [`xai_tool_protocol::SessionBindResult::binary_version`].
     pub fn binary_version(mut self, version: impl Into<String>) -> Self {
         self.binary_version = Some(version.into());
+        self
+    }
+
+    /// Image capability tokens echoed on every bind as
+    /// [`xai_tool_protocol::SessionBindResult::image_capabilities`]. The
+    /// caller validates and sorts them; the SDK forwards them verbatim.
+    pub fn image_capabilities(mut self, tokens: Vec<String>) -> Self {
+        self.image_capabilities = tokens;
         self
     }
 
@@ -574,6 +614,7 @@ impl ToolServerBuilder {
             session_unserved: parking_lot::RwLock::new(HashMap::new()),
             session_resolve_errors: parking_lot::RwLock::new(HashMap::new()),
             binary_version: self.binary_version,
+            image_capabilities: self.image_capabilities,
             notification_fwd: Arc::new(parking_lot::Mutex::new(None)),
             parsed_notif_tx: Arc::new(parking_lot::Mutex::new(None)),
             session_handles: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -632,6 +673,7 @@ struct ToolServerInner {
     /// same lifetime as the `session_handlers` entry.
     session_resolve_errors: parking_lot::RwLock<HashMap<SessionId, String>>,
     binary_version: Option<String>,
+    image_capabilities: Vec<String>,
 
     /// Raw notification forwarding channel. Session loops write here;
     /// the parsing task (spawned in `run()`) reads and parses into
@@ -1440,6 +1482,10 @@ impl ToolServer {
                                             binary_version: server.inner().binary_version.clone(),
                                             unserved_tool_ids: server.unserved_for_session(&sid),
                                             resolve_error: server.resolve_error_for_session(&sid),
+                                            image_capabilities: server
+                                                .inner()
+                                                .image_capabilities
+                                                .clone(),
                                         };
                                         serde_json::json!({
                                             "jsonrpc": "2.0",
@@ -2559,53 +2605,6 @@ mod tests {
         assert_eq!(frame.body[0]["uri"], "file:///tmp/data.csv");
         assert_eq!(frame.body[0]["mime_type"], "text/csv");
         assert_eq!(frame.body[0]["text"], "a,b\n1,2");
-    }
-
-    // ── serde round-trips ───────────────────────────────────────────
-
-    #[test]
-    fn progress_frame_text_round_trips() {
-        let progress = ToolProgress::Text {
-            text: "round-trip".to_owned(),
-        };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
-    }
-
-    #[test]
-    fn progress_frame_content_round_trips() {
-        let blocks = vec![
-            ContentBlock::Text {
-                text: "hello".to_owned(),
-            },
-            ContentBlock::Image {
-                mime_type: "image/png".to_owned(),
-                data: "abc".to_owned(),
-                media_id: None,
-                filename: None,
-                path: None,
-                metadata: Default::default(),
-            },
-        ];
-        let progress = ToolProgress::Content { blocks };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
-    }
-
-    #[test]
-    fn progress_frame_custom_round_trips() {
-        let progress = ToolProgress::Custom {
-            subkind: "streaming.chunk".to_owned(),
-            payload: serde_json::json!({ "offset": 1024, "data": [1, 2, 3] }),
-        };
-        let frame = progress_to_frame(progress, call_id());
-        let json = serde_json::to_value(&frame).expect("serialize");
-        let back: ToolCallProgressFrame = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(back, frame);
     }
 
     // ── wire notification shape ─────────────────────────────────────

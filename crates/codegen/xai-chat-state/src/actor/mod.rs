@@ -120,6 +120,11 @@ impl ChatStateActor {
             ChatStateCommand::PushUserMessage { item } => {
                 self.push_user_message(item);
             }
+            ChatStateCommand::PushUserMessagesBatch { items } => {
+                for item in items {
+                    self.push_user_message(item);
+                }
+            }
             ChatStateCommand::PushUserMessageAndAck { item, reply } => {
                 self.push_user_message(item);
                 let _ = reply.send(());
@@ -131,6 +136,10 @@ impl ChatStateActor {
             } => {
                 let generation = cwd_generation.get();
                 let candidate = ConversationItem::working_directory_switch(content, generation);
+                // Pop a crash-stranded reminder BEFORE the strict append: the
+                // pop rewrites history from the in-memory image, which must
+                // not yet contain the acked append, or the rewrite erases it.
+                self.pop_stranded_continue_reminder();
                 let persist_rx = self
                     .persistence
                     .persist_working_directory_switch_and_ack(&candidate);
@@ -168,6 +177,12 @@ impl ChatStateActor {
             }
             ChatStateCommand::PushToolResult { item } => {
                 self.push_message(item);
+            }
+            ChatStateCommand::PushModelOutput { item } => {
+                self.push_model_output(item);
+            }
+            ChatStateCommand::PushUnreportedModelOutput { item } => {
+                self.push_unreported_model_output(item);
             }
             ChatStateCommand::RecordTokenUsage { total_tokens } => {
                 self.record_token_usage(total_tokens);
@@ -240,6 +255,28 @@ impl ChatStateActor {
                 };
                 let _ = reply.send(result);
             }
+            ChatStateCommand::StripConversationImages { urls, reply } => {
+                match self.strip_conversation_images(&urls) {
+                    None => {
+                        let _ = reply.send(crate::StripOutcome::NoMatch);
+                    }
+                    Some((stripped, ack_rx)) => {
+                        // Await the disk ack off-actor: the persistence
+                        // channel already orders the write against later
+                        // commands, and blocking here would stall reads
+                        // behind an fsync.
+                        tokio::spawn(async move {
+                            let outcome = match ack_rx.await {
+                                Ok(Ok(())) => crate::StripOutcome::Applied { stripped },
+                                Ok(Err(_)) | Err(_) => {
+                                    crate::StripOutcome::WriteFailed { stripped }
+                                }
+                            };
+                            let _ = reply.send(outcome);
+                        });
+                    }
+                }
+            }
             ChatStateCommand::ReplaceSystemHead { prompt, reply } => {
                 let changed = self.replace_system_head(&prompt);
                 let _ = reply.send(changed);
@@ -274,6 +311,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::RepairDanglingAfterHarnessHalt { class } => {
                 self.repair_dangling_after_harness_halt(class);
+            }
+            ChatStateCommand::PopStrandedContinueReminder => {
+                self.pop_stranded_continue_reminder();
             }
 
             // ═══ Queries ═══
@@ -403,6 +443,9 @@ impl ChatStateActor {
             }
             ChatStateCommand::GetLastAssistantText { reply } => {
                 let _ = reply.send(self.get_last_assistant_text());
+            }
+            ChatStateCommand::GetTrailingAssistantReport { reply } => {
+                let _ = reply.send(self.get_trailing_assistant_report());
             }
             ChatStateCommand::GetLastAssistantTextInTurn { reply } => {
                 let _ = reply.send(self.get_last_assistant_text_in_turn());
