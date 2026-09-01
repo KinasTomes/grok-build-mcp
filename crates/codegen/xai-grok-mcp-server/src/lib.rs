@@ -196,8 +196,8 @@ impl GatewaySession {
             .lock()
             .await
             .set_client_event_tx(Some(event_tx.clone()));
-        let event_writer = xai_file_utils::events::EventWriter::noop();
-        let ctx = xai_grok_mcp::servers::McpSpawnCtx::session_less(&event_writer);
+        let event_writer = xai_grok_session_events::EventWriter::noop();
+        let ctx = xai_grok_mcp::servers::McpSpawnCtx::standalone(&event_writer);
         let started = xai_grok_mcp::servers::start_mcp_servers(
             native.servers,
             &Default::default(),
