@@ -329,9 +329,9 @@ fn observer_tool_block(
                 old_text, new_text, ..
             }),
             ToolCallBlock::Edit(edit),
-        ) => edit.set_hunks(crate::diff::diff_hunks_from_strings(old_text, new_text, 1)),
+        ) => edit.set_hunks(xai_grok_pager_diff::diff_hunks_from_strings(old_text, new_text, 1)),
         (Some(ObserverToolDetails::Write { content, .. }), ToolCallBlock::Edit(edit)) => {
-            edit.set_hunks(crate::diff::diff_hunks_from_strings("", content, 1));
+            edit.set_hunks(xai_grok_pager_diff::diff_hunks_from_strings("", content, 1));
             edit.prefix = "Creating ";
         }
         _ => {}
@@ -835,6 +835,7 @@ fn observer_permission_view(event: &ObserverEvent, active_idx: usize) -> Permiss
         active_idx,
         bash_highlights: None,
         bash_selection_count: 0,
+        bash_deny_selection_count: 0,
         bash_command_raw: None,
         mcp_scope: None,
         title: format!("Allow {tool_name}?"),
