@@ -2979,7 +2979,7 @@ impl McpClient {
         let service = {
             let mut state = self.state.lock().await;
             match std::mem::replace(&mut *state, ClientState::Empty) {
-                ClientState::Ready(service) => Some(service),
+                ClientState::Ready { service, .. } => Some(service),
                 previous => {
                     *state = previous;
                     None
