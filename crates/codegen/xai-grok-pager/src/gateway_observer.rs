@@ -354,7 +354,7 @@ fn set_tool_error(tool: &mut ToolCallBlock, error: String) {
         ToolCallBlock::UseTool(block) => block.set_error(Some(error)),
         ToolCallBlock::MemorySearch(block) => block.set_error(Some(error)),
         ToolCallBlock::Skill(block) | ToolCallBlock::Other(block) => block.set_error(Some(error)),
-        ToolCallBlock::Lifecycle(_) => {}
+        ToolCallBlock::SentMessage(_) | ToolCallBlock::Lifecycle(_) => {}
     }
 }
 
