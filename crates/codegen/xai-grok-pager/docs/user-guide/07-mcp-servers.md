@@ -100,6 +100,11 @@ export GROK_MCP_API_KEY="replace-with-a-random-secret"
 grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless --stateless
 ```
 
+For unattended execution, add `--always-approve` (aliases: `--yolo` and
+`--dangerously-skip-permissions`). It auto-approves calls that would normally
+prompt, but hard denials such as destructive commands and paths outside the
+workspace still apply.
+
 Clients must send it on every MCP request:
 
 ```toml

@@ -160,6 +160,13 @@ pub struct GatewayServerArgs {
     /// Use the existing terminal approval fallback instead of the observer UI.
     #[arg(long)]
     pub terminal_approval: bool,
+    /// Auto-approve promptable calls; hard policy denials still apply.
+    #[arg(
+        long = "always-approve",
+        alias = "yolo",
+        alias = "dangerously-skip-permissions"
+    )]
+    pub always_approve: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -245,6 +252,11 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
             xai_grok_mcp_server::GatewaySession::with_native_mcp_config(&workspace, path).await?
         }
         None => xai_grok_mcp_server::GatewaySession::new(&workspace)?,
+    };
+    let session = if args.always_approve {
+        session.with_always_approve()
+    } else {
+        session
     };
 
     // HTTP starts in observer mode by default. A terminal-approval broker is
@@ -906,6 +918,27 @@ mod tests {
                 command: McpCommand::Add(add),
             })) => add,
             other => panic!("expected mcp add, got {other:?}"),
+        }
+    }
+
+    fn parse_gateway(argv: &[&str]) -> GatewayServerArgs {
+        let args = PagerArgs::try_parse_from(argv).expect("args should parse");
+        match args.command {
+            Some(Command::Mcp(McpArgs {
+                command: McpCommand::Server(gateway),
+            })) => gateway,
+            other => panic!("expected mcp server, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_always_approve_aliases_parse() {
+        for flag in [
+            "--always-approve",
+            "--yolo",
+            "--dangerously-skip-permissions",
+        ] {
+            assert!(parse_gateway(&["grok", "mcp", "server", flag]).always_approve);
         }
     }
 

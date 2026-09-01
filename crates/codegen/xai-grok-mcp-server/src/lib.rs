@@ -235,6 +235,12 @@ impl GatewaySession {
         &self.permission
     }
 
+    /// Auto-approve promptable calls while retaining hard policy denials.
+    pub fn with_always_approve(mut self) -> Self {
+        self.permission = self.permission.with_always_approve();
+        self
+    }
+
     pub fn event_bus(&self) -> &GatewayEventBus {
         &self.events
     }
