@@ -167,6 +167,9 @@ pub struct GatewayServerArgs {
         alias = "dangerously-skip-permissions"
     )]
     pub always_approve: bool,
+    /// Disable API key authentication for the HTTP gateway.
+    #[arg(long = "no-auth")]
+    pub no_auth: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -243,7 +246,7 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
     if args.stateless && args.transport != GatewayTransport::Http {
         bail!("--stateless is only supported with --transport http");
     }
-    let api_key = (args.transport == GatewayTransport::Http)
+    let api_key = (args.transport == GatewayTransport::Http && !args.no_auth)
         .then(xai_grok_mcp_server::gateway_api_key_from_env)
         .transpose()?;
     let workspace = dunce::canonicalize(args.workspace.unwrap_or(std::env::current_dir()?))?;
@@ -940,6 +943,11 @@ mod tests {
         ] {
             assert!(parse_gateway(&["grok", "mcp", "server", flag]).always_approve);
         }
+    }
+
+    #[test]
+    fn gateway_no_auth_flag_parses() {
+        assert!(parse_gateway(&["grok", "mcp", "server", "--no-auth"]).no_auth);
     }
 
     #[test]
