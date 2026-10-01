@@ -837,6 +837,17 @@ async fn always_approve_runs_ask_but_preserves_hard_denials() {
         .unwrap();
     assert_eq!(promptable.is_error, Some(false));
 
+    let chained = client
+        .call_tool(
+            CallToolRequestParams::new("run_terminal_cmd").with_arguments(
+                serde_json::json!({"command":"echo part1 && echo part2","description":"test chained auto approval","is_background":false})
+                    .as_object().unwrap().clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chained.is_error, Some(false));
+
     let destructive = client
         .call_tool(
             CallToolRequestParams::new("run_terminal_cmd").with_arguments(
