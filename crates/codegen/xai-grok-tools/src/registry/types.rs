@@ -1997,7 +1997,43 @@ pub fn generate_schema<T: schemars::JsonSchema>() -> serde_json::Value {
         obj.entry("required")
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
     }
+    normalize_schema(&mut value);
     value
+}
+
+/// Normalizes JSON Schema types by splitting array types (such as `["string", "null"]`)
+/// into portable `anyOf` branches (`[{"type": "string"}, {"type": "null"}]`).
+pub fn normalize_schema(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(type_val) = map.remove("type") {
+                match type_val {
+                    serde_json::Value::Array(arr) if arr.len() > 1 => {
+                        let any_of = arr
+                            .into_iter()
+                            .map(|t| serde_json::json!({ "type": t }))
+                            .collect();
+                        map.insert("anyOf".to_string(), serde_json::Value::Array(any_of));
+                    }
+                    serde_json::Value::Array(mut arr) if arr.len() == 1 => {
+                        map.insert("type".to_string(), arr.remove(0));
+                    }
+                    other => {
+                        map.insert("type".to_string(), other);
+                    }
+                }
+            }
+            for v in map.values_mut() {
+                normalize_schema(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                normalize_schema(v);
+            }
+        }
+        _ => {}
+    }
 }
 fn merge_json(base: &serde_json::Value, overlay: &serde_json::Value) -> serde_json::Value {
     match (base, overlay) {
@@ -4909,6 +4945,28 @@ mod tests {
             1,
             "a type's schema must be generated at most once per process"
         );
+    }
+    #[test]
+    fn generate_schema_normalizes_nullable_types_to_anyof() {
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code)]
+        struct NullableProbe {
+            field: Option<String>,
+            count: Option<u64>,
+            name: String,
+        }
+        let schema = generate_schema::<NullableProbe>();
+        assert_eq!(
+            schema["properties"]["field"]["anyOf"],
+            serde_json::json!([{"type": "string"}, {"type": "null"}])
+        );
+        assert!(schema["properties"]["field"].get("type").is_none());
+        assert_eq!(
+            schema["properties"]["count"]["anyOf"],
+            serde_json::json!([{"type": "integer"}, {"type": "null"}])
+        );
+        assert!(schema["properties"]["count"].get("type").is_none());
+        assert_eq!(schema["properties"]["name"]["type"], "string");
     }
     fn toolset_with_viewer_ctx(
         viewer_ctx: Option<xai_tool_runtime::WorkspaceViewerContext>,
