@@ -105,6 +105,13 @@ For unattended execution, add `--always-approve` (aliases: `--yolo` and
 prompt, but hard denials such as destructive commands and paths outside the
 workspace still apply.
 
+To disable API key authentication entirely (e.g. for local testing or behind an
+authenticating reverse proxy), pass `--no-auth`:
+
+```bash
+grok mcp server --transport http --host 127.0.0.1 --port 8765 --headless --stateless --no-auth
+```
+
 Clients must send it on every MCP request:
 
 ```toml

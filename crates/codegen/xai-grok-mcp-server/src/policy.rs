@@ -114,10 +114,10 @@ impl GatewayPermission {
     }
 
     fn shell_decision(&self, command: &str) -> GatewayPermissionDecision {
-        if self.shell_policy == ShellPolicy::DenyAll {
+        if self.shell_policy == ShellPolicy::DenyAll || destructive_command(command) {
             return GatewayPermissionDecision::Deny;
         }
-        if command.contains([';', '|', '&', '>', '<', '`', '\n']) || destructive_command(command) {
+        if !self.always_approve && command.contains([';', '|', '&', '>', '<', '`', '\n']) {
             return GatewayPermissionDecision::Deny;
         }
         let mut words = command.split_whitespace();
