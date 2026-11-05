@@ -170,6 +170,9 @@ pub struct GatewayServerArgs {
     /// Disable API key authentication for the HTTP gateway.
     #[arg(long = "no-auth")]
     pub no_auth: bool,
+    /// Additional allowed paths outside the workspace (repeatable).
+    #[arg(long = "allow-path", value_name = "PATH")]
+    pub allow_path: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -258,6 +261,11 @@ async fn run_gateway_server(args: GatewayServerArgs) -> Result<()> {
     };
     let session = if args.always_approve {
         session.with_always_approve()
+    } else {
+        session
+    };
+    let session = if !args.allow_path.is_empty() {
+        session.with_allowed_paths(args.allow_path)
     } else {
         session
     };
@@ -948,6 +956,18 @@ mod tests {
     #[test]
     fn gateway_no_auth_flag_parses() {
         assert!(parse_gateway(&["grok", "mcp", "server", "--no-auth"]).no_auth);
+    }
+
+    #[test]
+    fn gateway_allow_path_flag_parses() {
+        let args = parse_gateway(&[
+            "grok",
+            "mcp",
+            "server",
+            "--allow-path",
+            "/home/ubuntu/.local",
+        ]);
+        assert_eq!(args.allow_path, vec![PathBuf::from("/home/ubuntu/.local")]);
     }
 
     #[test]

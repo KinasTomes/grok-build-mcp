@@ -13700,6 +13700,7 @@ dependencies = [
  "xai-grok-config-types",
  "xai-grok-mcp",
  "xai-grok-sandbox",
+ "xai-grok-session-events",
  "xai-grok-tools",
 ]
 
