@@ -241,6 +241,12 @@ impl GatewaySession {
         self
     }
 
+    /// Add extra permitted paths outside the workspace.
+    pub fn with_allowed_paths(mut self, paths: Vec<PathBuf>) -> Self {
+        self.permission = self.permission.with_allowed_paths(paths);
+        self
+    }
+
     pub fn event_bus(&self) -> &GatewayEventBus {
         &self.events
     }
