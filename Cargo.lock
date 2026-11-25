@@ -13687,6 +13687,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "clap",
+ "crossterm",
+ "dunce",
+ "ratatui",
  "rmcp",
  "serde",
  "serde_json",
@@ -13696,6 +13700,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "xai-file-utils",
  "xai-grok-config-types",
  "xai-grok-mcp",

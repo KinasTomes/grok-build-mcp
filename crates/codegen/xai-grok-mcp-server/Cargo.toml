@@ -17,9 +17,14 @@ subtle = "2"
 serde_json = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
+clap = { workspace = true, optional = true }
+dunce = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+ratatui = { workspace = true, optional = true, features = ["crossterm"] }
+crossterm = { workspace = true, optional = true, features = ["event-stream"] }
 xai-file-utils = { path = "../xai-file-utils" }
 xai-grok-sandbox = { path = "../xai-grok-sandbox" }
 xai-grok-mcp = { workspace = true }
@@ -37,6 +42,15 @@ rmcp = { version = "2.1", default-features = false, features = [
 ] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+cli = ["dep:clap", "dep:dunce", "dep:tracing-subscriber"]
+ui = ["cli", "dep:ratatui", "dep:crossterm"]
+
+[[bin]]
+name = "xai-grok-mcp"
+path = "src/bin/xai_grok_mcp/main.rs"
+required-features = ["cli"]
 
 [lints]
 workspace = true
